@@ -1,454 +1,382 @@
-const express = require("express");
+// NEXUS HUB — server.js
+// Telegram: @NexusStoreOfficiall
+
+const express = require('express');
 const app = express();
 app.use(express.json());
 
-const BOT_TOKEN  = process.env.BOT_TOKEN;
-const ADMIN_ID   = Number(process.env.ADMIN_ID);
-const ADMIN_PASS = process.env.ADMIN_PASSWORD || "nexus2024";
-const API = `https://api.telegram.org/bot${BOT_TOKEN}`;
+const TOKEN    = process.env.BOT_TOKEN;
+const ADMIN_ID = process.env.ADMIN_ID;
+const ADMIN_PW = process.env.ADMIN_PASSWORD || 'nexus2024';
+const PORT     = process.env.PORT || 3000;
+const BASE_URL = `https://api.telegram.org/bot${TOKEN}`;
 
-let keys        = {};
-let users       = {};
-let maintenance = { active:false, msg:"" };
-let announcement= { active:false, msg:"" };
-let sessions    = {};
+// ══════════════════════════════════════
+// VERİ DEPOLAMA (bellek - ücretsiz plan)
+// ══════════════════════════════════════
+const users = {};       // { telegramId: { username, rank, banned, registered } }
+const keys  = {};       // { keyStr: { rank, game, expire, used, usedBy } }
+const sessions = {};    // { telegramId: { step, data... } }
+let maintenance = false;
+let announcementMsg = '';
 
-const RANKS      = ["MOD","ADMIN","OWNER"];
-const RANK_PERMS = {
-    MOD:   ["listkeys","status","benim"],
-    ADMIN: ["listkeys","status","benim","key","delexpired"],
-    OWNER: ["listkeys","status","benim","key","delexpired","delkey","yetkiver","yasakla","maintenance","kullanicilar"],
-};
-
-function hasPerm(userId,perm){
-    const u=users[userId];
-    if(!u||u.banned)return false;
-    return(RANK_PERMS[u.rank]||[]).includes(perm);
-}
-function randStr(n){
-    const c="ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    let s="";for(let i=0;i<n;i++)s+=c[Math.floor(Math.random()*c.length)];return s;
-}
-function randKey(rank,expire){
-    const code=randStr(6);let suffix="PERM";
-    if(expire!==0){const r=expire-Date.now()/1000;
-        if(r<=86400)suffix="DAY";
-        else if(r<=86400*7)suffix="WEEK";
-        else if(r<=86400*30)suffix="MONTH";
-        else suffix="LONG";
-    }
-    return`NEXUS-${suffix}-${code}`;
-}
-function expireFrom(s){
-    if(!s||s==="sonsuz")return 0;const n=parseInt(s);
-    if(s.endsWith("h"))return Date.now()/1000+n*3600;
-    if(s.endsWith("d"))return Date.now()/1000+n*86400;
-    if(s.endsWith("w"))return Date.now()/1000+n*86400*7;
-    if(s.endsWith("m"))return Date.now()/1000+n*86400*30;
-    return Date.now()/1000+n*86400;
-}
-function expireLabel(exp){
-    if(exp===0)return"♾️ Sonsuz";const r=exp-Date.now()/1000;
-    if(r<0)return"❌ Süresi dolmuş";if(r<3600)return`${Math.floor(r/60)} dakika`;
-    if(r<86400)return`${Math.floor(r/3600)} saat`;if(r<86400*7)return`${Math.floor(r/86400)} gün`;
-    if(r<86400*30)return`${Math.floor(r/86400/7)} hafta`;return`${Math.floor(r/86400/30)} ay`;
-}
-function durLabel(s){return{"1d":"1 Gün","2d":"2 Gün","7d":"1 Hafta","30d":"1 Ay","sonsuz":"Sonsuz"}[s]||s;}
-function gameLabel(g){return{"all":"🎮 Tüm Oyunlar","kukirin":"🛴 Kukirin Life","buildweld":"🔧 Build and Weld"}[g]||g;}
-function rankEmoji(r){return{"OWNER":"👑","ADMIN":"🛡️","MOD":"🔰"}[r]||"❓";}
-
-async function send(chatId,text,extra={}){
-    await fetch(`${API}/sendMessage`,{method:"POST",headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({chat_id:chatId,text,parse_mode:"HTML",...extra})});
-}
-async function editMsg(chatId,msgId,text,extra={}){
-    await fetch(`${API}/editMessageText`,{method:"POST",headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({chat_id:chatId,message_id:msgId,text,parse_mode:"HTML",...extra})});
-}
-async function answerCb(id,text=""){
-    await fetch(`${API}/answerCallbackQuery`,{method:"POST",headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({callback_query_id:id,text})});
-}
-async function deleteMsg(chatId,msgId){
-    await fetch(`${API}/deleteMessage`,{method:"POST",headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({chat_id:chatId,message_id:msgId})});
+// ══════════════════════════════════════
+// YARDIMCI
+// ══════════════════════════════════════
+function randomKey(prefix) {
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    let r = '';
+    for (let i = 0; i < 6; i++) r += chars[Math.floor(Math.random() * chars.length)];
+    return `NEXUS-${prefix}-${r}`;
 }
 
-function girisMenusu(username){
-    return{reply_markup:{inline_keyboard:[
-        [{text:"📝  Kayıt Ol",  callback_data:"kayit_ol"}],
-        [{text:"🔐  Giriş Yap", callback_data:"giris_yap"}],
-    ]}};
-}
-function sureBtns(){return{inline_keyboard:[
-    [{text:"1️⃣  1 Gün",callback_data:"s_1d"},{text:"2️⃣  2 Gün",callback_data:"s_2d"}],
-    [{text:"📅  1 Hafta",callback_data:"s_7d"},{text:"🗓️  1 Ay",callback_data:"s_30d"}],
-    [{text:"♾️  Sonsuz",callback_data:"s_sonsuz"}],
-    [{text:"❌  İptal",callback_data:"iptal"}],
-]};}
-function rankBtns(dur){return{inline_keyboard:[
-    [{text:"👤  USER",callback_data:`r_USER_${dur}`},{text:"🛡️  ADMIN",callback_data:`r_ADMIN_${dur}`}],
-    [{text:"👑  OWNER",callback_data:`r_OWNER_${dur}`}],
-    [{text:"🔙  Geri",callback_data:"geri_sure"},{text:"❌  İptal",callback_data:"iptal"}],
-]};}
-function gameBtns(dur,rank){return{inline_keyboard:[
-    [{text:"🎮  Tüm Oyunlar",callback_data:`g_all_${dur}_${rank}`}],
-    [{text:"🛴  Kukirin Life",callback_data:`g_kukirin_${dur}_${rank}`}],
-    [{text:"🔧  Build and Weld",callback_data:`g_buildweld_${dur}_${rank}`}],
-    [{text:"🔙  Geri",callback_data:`geri_rank_${dur}`},{text:"❌  İptal",callback_data:"iptal"}],
-]};}
-function anaMenu(){return{inline_keyboard:[
-    [{text:"🔑  Key Oluştur",callback_data:"m_key"}],
-    [{text:"📋  Keyler",callback_data:"m_list"},{text:"🧹  Süresizleri Sil",callback_data:"m_delexp"}],
-    [{text:"👥  Kullanıcılar",callback_data:"m_users"},{text:"📊  Durum",callback_data:"m_status"}],
-    [{text:"🔧  Bakım Aç",callback_data:"m_maint_on"},{text:"✅  Bakım Kapat",callback_data:"m_maint_off"}],
-]};}
-function panelText(userId){
-    const u=users[userId];
-    const aktif=Object.values(keys).filter(v=>v.expire===0||v.expire>Date.now()/1000).length;
-    return`🎛️ <b>NEXUS HUB Paneli</b>\n\n`+
-        `👤 @${u.username}  ${rankEmoji(u.rank)} <b>${u.rank}</b>\n`+
-        `🔧 Bakım: ${maintenance.active?"AÇIK ⚠️":"KAPALI ✅"}\n`+
-        `🔑 Aktif Key: ${aktif}`;
+function expireMs(type) {
+    const map = { '1G': 86400000, '2G': 172800000, '1H': 604800000, '1A': 2592000000, 'SONSUZ': null };
+    return map[type] || null;
 }
 
-app.post("/webhook",async(req,res)=>{
-    const body=req.body;
+function keyPrefix(type) {
+    const map = { '1G': 'DAY', '2G': 'DAY2', '1H': 'WEEK', '1A': 'MONTH', 'SONSUZ': 'PERM' };
+    return map[type] || 'PERM';
+}
 
-    // ── CALLBACK ──────────────────────────────
-    if(body.callback_query){
-        const cb=body.callback_query;
-        const chatId=cb.message.chat.id;
-        const userId=cb.from.id;
-        const msgId=cb.message.message_id;
-        const data=cb.data;
-        const username=cb.from.username||`user_${userId}`;
-        await answerCb(cb.id);
+function rankLabel(r) {
+    const m = { OWNER: '👑 OWNER', ADMIN: '🛡 ADMIN', MOD: '🔰 MOD', USER: '👤 USER' };
+    return m[r] || '👤 USER';
+}
 
-        // Kayıt Ol / Giriş Yap butonları
-        if(data==="kayit_ol"||data==="giris_yap"){
-            if(users[userId]){
-                if(users[userId].banned){
-                    await editMsg(chatId,msgId,"⛔ Erişimin engellendi.");
-                    return res.send("ok");
-                }
-                await editMsg(chatId,msgId,panelText(userId),{reply_markup:anaMenu()});
-                return res.send("ok");
-            }
-            sessions[chatId]={step:"ask_password",username};
-            await editMsg(chatId,msgId,
-                `👤 @${username}\n\n`+
-                `🔐 Giriş şifreni yaz:\n`+
-                `<i>(Mesajın otomatik silinecek)</i>`
-            );
-            return res.send("ok");
-        }
+function gameLabel(g) {
+    const m = { all: '🌍 Tüm Oyunlar', kukirin: '🌾 Kukirin', buildweld: '🔧 Build & Weld', sdrp: '🏙️ San Diego RP' };
+    return m[g] || g;
+}
 
-        // Kayıtsız kullanıcı kontrolü
-        const u=users[userId];
-        if(!u){
-            await editMsg(chatId,msgId,
-                `❌ Önce /start ile kayıt ol.`,
-                girisMenusu(username)
-            );
-            return res.send("ok");
-        }
-        if(u.banned){await editMsg(chatId,msgId,"⛔ Erişimin engellendi.");return res.send("ok");}
+function isOwner(id)  { return String(id) === String(ADMIN_ID) || (users[id] && users[id].rank === 'OWNER'); }
+function isAdmin(id)  { return isOwner(id) || (users[id] && users[id].rank === 'ADMIN'); }
+function isMod(id)    { return isAdmin(id) || (users[id] && users[id].rank === 'MOD'); }
 
-        if(data==="iptal"){
-            delete sessions[chatId];
-            await editMsg(chatId,msgId,"❌ İptal edildi.",{reply_markup:anaMenu()});
-            return res.send("ok");
-        }
-        if(data==="ana_menu"){
-            await editMsg(chatId,msgId,panelText(userId),{reply_markup:anaMenu()});
-            return res.send("ok");
-        }
+// ══════════════════════════════════════
+// TELEGRAM API
+// ══════════════════════════════════════
+async function tg(method, body) {
+    const https = require('https');
+    return new Promise((res, rej) => {
+        const data = JSON.stringify(body);
+        const req = https.request(`${BASE_URL}/${method}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) }
+        }, r => { let d = ''; r.on('data', c => d += c); r.on('end', () => res(JSON.parse(d))); });
+        req.on('error', rej);
+        req.write(data);
+        req.end();
+    });
+}
 
-        // Ana menü
-        if(data==="m_key"){
-            if(!hasPerm(userId,"key")){await editMsg(chatId,msgId,"❌ Yetkin yok.");return res.send("ok");}
-            await editMsg(chatId,msgId,"🔑 <b>Key Oluştur</b>\n\n⏱️ Süre seç:",{reply_markup:sureBtns()});
-            return res.send("ok");
-        }
-        if(data==="m_list"){
-            if(!hasPerm(userId,"listkeys")){await editMsg(chatId,msgId,"❌ Yetkin yok.");return res.send("ok");}
-            const list=Object.entries(keys).filter(([,v])=>v.expire===0||v.expire>Date.now()/1000);
-            if(!list.length){await editMsg(chatId,msgId,"📋 Aktif key yok.",{reply_markup:anaMenu()});return res.send("ok");}
-            let t=`📋 <b>Aktif Keyler (${list.length})</b>\n\n`;
-            for(const[k,v]of list){
-                t+=`🔑 <code>${k}</code>\n`;
-                t+=`   ${rankEmoji(v.rank)} ${v.rank}  •  ⏱️ ${expireLabel(v.expire)}  •  ${gameLabel(v.game||"all")}\n\n`;
-            }
-            await editMsg(chatId,msgId,t,{reply_markup:anaMenu()});
-            return res.send("ok");
-        }
-        if(data==="m_delexp"){
-            if(!hasPerm(userId,"delexpired")){await editMsg(chatId,msgId,"❌ Yetkin yok.");return res.send("ok");}
-            let n=0;
-            for(const[k,v]of Object.entries(keys)){if(v.expire!==0&&v.expire<Date.now()/1000){delete keys[k];n++;}}
-            await editMsg(chatId,msgId,`🧹 ${n} key silindi.`,{reply_markup:anaMenu()});
-            return res.send("ok");
-        }
-        if(data==="m_status"){
-            if(!hasPerm(userId,"status")){await editMsg(chatId,msgId,"❌ Yetkin yok.");return res.send("ok");}
-            const total=Object.keys(keys).length;
-            const active=Object.values(keys).filter(v=>v.expire===0||v.expire>Date.now()/1000).length;
-            await editMsg(chatId,msgId,
-                `📊 <b>NEXUS HUB</b>\n\n`+
-                `🔧 Bakım: ${maintenance.active?"AÇIK ⚠️":"KAPALI ✅"}\n`+
-                `🔑 Aktif: ${active} / ${total}\n`+
-                `👥 Kullanıcı: ${Object.keys(users).length}`,
-                {reply_markup:anaMenu()});
-            return res.send("ok");
-        }
-        if(data==="m_users"){
-            if(!hasPerm(userId,"kullanicilar")){await editMsg(chatId,msgId,"❌ Yetkin yok.");return res.send("ok");}
-            const list=Object.entries(users);
-            if(!list.length){await editMsg(chatId,msgId,"👥 Kullanıcı yok.",{reply_markup:anaMenu()});return res.send("ok");}
-            let t=`👥 <b>Kullanıcılar (${list.length})</b>\n\n`;
-            for(const[,u2]of list){
-                t+=`${rankEmoji(u2.rank)} @${u2.username}  <b>${u2.rank}</b>${u2.banned?" ⛔":""}\n`;
-            }
-            await editMsg(chatId,msgId,t,{reply_markup:anaMenu()});
-            return res.send("ok");
-        }
-        if(data==="m_maint_on"){
-            if(!hasPerm(userId,"maintenance")){await editMsg(chatId,msgId,"❌ Yetkin yok.");return res.send("ok");}
-            maintenance={active:true,msg:"🔧 BAKIM MODUNDADIR — EN YAKIN ZAMANDA AÇILACAKTIR"};
-            announcement={active:true,msg:"🔧 BAKIM MODUNDADIR — EN YAKIN ZAMANDA AÇILACAKTIR"};
-            await editMsg(chatId,msgId,"🔧 <b>Bakım modu AÇIK.</b>\n\nTüm kullanıcılar 45 saniye içinde atılacak.",{reply_markup:anaMenu()});
-            return res.send("ok");
-        }
-        if(data==="m_maint_off"){
-            if(!hasPerm(userId,"maintenance")){await editMsg(chatId,msgId,"❌ Yetkin yok.");return res.send("ok");}
-            maintenance={active:false,msg:""};
-            announcement={active:false,msg:""};
-            await editMsg(chatId,msgId,"✅ <b>Bakım modu KAPALI.</b>",{reply_markup:anaMenu()});
-            return res.send("ok");
-        }
+function send(chatId, text, extra = {}) {
+    return tg('sendMessage', { chat_id: chatId, text, parse_mode: 'HTML', ...extra });
+}
 
-        // Key akışı
-        if(data.startsWith("s_")){
-            if(!hasPerm(userId,"key")){await editMsg(chatId,msgId,"❌ Yetkin yok.");return res.send("ok");}
-            const dur=data.replace("s_","");
-            await editMsg(chatId,msgId,
-                `🔑 <b>Key Oluştur</b>\n\n⏱️ Süre: <b>${durLabel(dur)}</b>\n\n👑 Rank seç:`,
-                {reply_markup:rankBtns(dur)});
-            return res.send("ok");
-        }
-        if(data==="geri_sure"){
-            await editMsg(chatId,msgId,"🔑 <b>Key Oluştur</b>\n\n⏱️ Süre seç:",{reply_markup:sureBtns()});
-            return res.send("ok");
-        }
-        if(data.startsWith("r_")){
-            if(!hasPerm(userId,"key")){await editMsg(chatId,msgId,"❌ Yetkin yok.");return res.send("ok");}
-            const p=data.split("_");const rank=p[1];const dur=p[2];
-            await editMsg(chatId,msgId,
-                `🔑 <b>Key Oluştur</b>\n\n⏱️ Süre: <b>${durLabel(dur)}</b>\n${rankEmoji(rank)} Rank: <b>${rank}</b>\n\n🎮 Oyun seç:`,
-                {reply_markup:gameBtns(dur,rank)});
-            return res.send("ok");
-        }
-        if(data.startsWith("geri_rank_")){
-            const dur=data.replace("geri_rank_","");
-            await editMsg(chatId,msgId,
-                `🔑 <b>Key Oluştur</b>\n\n⏱️ Süre: <b>${durLabel(dur)}</b>\n\n👑 Rank seç:`,
-                {reply_markup:rankBtns(dur)});
-            return res.send("ok");
-        }
-        if(data.startsWith("g_")){
-            if(!hasPerm(userId,"key")){await editMsg(chatId,msgId,"❌ Yetkin yok.");return res.send("ok");}
-            const p=data.split("_");const game=p[1];const dur=p[2];const rank=p[3];
-            const expire=expireFrom(dur);
-            const key=randKey(rank,expire);
-            keys[key]={rank,expire,game,created:Date.now()/1000};
-            await editMsg(chatId,msgId,
-                `✅ <b>Key Oluşturuldu!</b>\n\n`+
-                `🔑 <code>${key}</code>\n\n`+
-                `${rankEmoji(rank)} Rank: <b>${rank}</b>\n`+
-                `⏱️ Süre: <b>${durLabel(dur)}</b>\n`+
-                `🎮 Oyun: <b>${gameLabel(game)}</b>\n\n`+
-                `📋 Kopyalayıp kullanıcıya gönder.`,
-                {reply_markup:{inline_keyboard:[[
-                    {text:"🔑 Yeni Key",callback_data:"m_key"},
-                    {text:"🏠 Ana Menü",callback_data:"ana_menu"},
-                ]]}});
-            return res.send("ok");
-        }
+function edit(chatId, msgId, text, extra = {}) {
+    return tg('editMessageText', { chat_id: chatId, message_id: msgId, text, parse_mode: 'HTML', ...extra });
+}
 
-        return res.send("ok");
+function deleteMsg(chatId, msgId) {
+    return tg('deleteMessage', { chat_id: chatId, message_id: msgId });
+}
+
+// ══════════════════════════════════════
+// KULLANICI KAYIT / GİRİŞ
+// ══════════════════════════════════════
+async function handleStart(msg) {
+    const id  = msg.from.id;
+    const uname = msg.from.username || msg.from.first_name || String(id);
+
+    // İlk ADMIN_ID olanı OWNER yap
+    if (String(id) === String(ADMIN_ID) && !users[id]) {
+        users[id] = { username: uname, rank: 'OWNER', banned: false, registered: true };
     }
 
-    // ── MESAJLAR ──────────────────────────────
-    const msg=body.message;
-    if(!msg||!msg.text)return res.send("ok");
-    const chatId=msg.chat.id;
-    const userId=msg.from.id;
-    const text=msg.text.trim();
-    const lower=text.toLowerCase();
-    const username=msg.from.username||`user_${userId}`;
-
-    // Şifre bekliyorsa
-    if(sessions[chatId]?.step==="ask_password"){
-        await deleteMsg(chatId,msg.message_id);
-        if(text!==ADMIN_PASS){
-            await send(chatId,"❌ <b>Yanlış şifre!</b>\n\n🔐 Tekrar dene:");
-            return res.send("ok");
-        }
-        const uname=sessions[chatId].username;
-        const isOwner=userId===ADMIN_ID;
-        users[userId]={
-            username:uname,
-            rank:isOwner?"OWNER":"MOD",
-            banned:false,
-            registeredAt:Date.now()/1000,
-        };
-        delete sessions[chatId];
-        await send(chatId,
-            `✅ <b>Giriş Başarılı!</b>\n\n`+
-            `👤 @${uname}\n`+
-            `${rankEmoji(users[userId].rank)} Rank: <b>${users[userId].rank}</b>`,
-            {reply_markup:anaMenu()});
-        return res.send("ok");
+    if (users[id] && users[id].registered) {
+        return showPanel(id, uname);
     }
 
-    // /start
-    if(lower==="/start"){
-        if(users[userId]){
-            if(users[userId].banned){await send(chatId,"⛔ Erişimin engellendi.");return res.send("ok");}
-            await send(chatId,panelText(userId),{reply_markup:anaMenu()});
-            return res.send("ok");
-        }
-        await send(chatId,
-            `👋 <b>NEXUS HUB Yönetim Paneli</b>\n\n`+
-            `👤 @${username}\n\n`+
-            `Devam etmek için seç:`,
-            {reply_markup:{inline_keyboard:[
-                [{text:"📝  Kayıt Ol",  callback_data:"kayit_ol"}],
-                [{text:"🔐  Giriş Yap", callback_data:"giris_yap"}],
+    sessions[id] = { step: 'await_register_choice', username: uname };
+
+    await send(id,
+        `🎮 <b>NEXUS HUB</b>'a hoş geldin, <b>@${uname}</b>!\n\n` +
+        `Devam etmek için bir seçenek seç:`,
+        { reply_markup: { inline_keyboard: [
+            [{ text: '📝 Kayıt Ol', callback_data: 'auth_register' }],
+            [{ text: '🔑 Giriş Yap', callback_data: 'auth_login' }],
+        ]}}
+    );
+}
+
+async function showPanel(id, uname) {
+    const u = users[id];
+    const rank = u ? rankLabel(u.rank) : '👤 USER';
+    await send(id,
+        `✅ <b>Giriş başarılı!</b>\n\n👤 Kullanıcı: @${uname}\n${rank}\n\n<b>NEXUS HUB Paneli</b>`,
+        { reply_markup: { inline_keyboard: [
+            [{ text: '🔑 Key Oluştur', callback_data: 'panel_key' }],
+            [{ text: '👤 Profilim',     callback_data: 'panel_profile' }],
+            [{ text: '📢 Duyuru',       callback_data: 'panel_announce' }],
+            [{ text: '⚙️ Yönetim',      callback_data: 'panel_admin' }],
+        ]}}
+    );
+}
+
+// ══════════════════════════════════════
+// KEY OLUŞTURMA AKIŞI
+// ══════════════════════════════════════
+async function startKeyFlow(id, msgId) {
+    if (!isMod(id)) return send(id, '❌ Yetersiz yetki.');
+    sessions[id] = { step: 'key_sure', msgId };
+    await edit(id, msgId,
+        '🔑 <b>Key Oluştur</b>\n\nSüre seçin:',
+        { reply_markup: { inline_keyboard: [
+            [{ text: '1 Gün',   callback_data: 'ks_1G' },  { text: '2 Gün',  callback_data: 'ks_2G' }],
+            [{ text: '1 Hafta', callback_data: 'ks_1H' },  { text: '1 Ay',   callback_data: 'ks_1A' }],
+            [{ text: '♾ Sonsuz', callback_data: 'ks_SONSUZ' }],
+            [{ text: '◀ Geri',  callback_data: 'panel_back' }],
+        ]}}
+    );
+}
+
+async function keyRankStep(id, msgId, sure) {
+    sessions[id] = { step: 'key_rank', msgId, sure };
+    await edit(id, msgId,
+        `🔑 Süre: <b>${sure}</b>\n\nRank seçin:`,
+        { reply_markup: { inline_keyboard: [
+            [{ text: '👑 OWNER', callback_data: 'kr_OWNER' }, { text: '🛡 ADMIN', callback_data: 'kr_ADMIN' }],
+            [{ text: '🔰 MOD',  callback_data: 'kr_MOD'   }, { text: '👤 USER',  callback_data: 'kr_USER'  }],
+            [{ text: '◀ Geri',  callback_data: 'panel_key' }],
+        ]}}
+    );
+}
+
+async function keyGameStep(id, msgId, sure, rank) {
+    sessions[id] = { step: 'key_game', msgId, sure, rank };
+    await edit(id, msgId,
+        `🔑 Süre: <b>${sure}</b> | Rank: <b>${rank}</b>\n\nOyun seçin:`,
+        { reply_markup: { inline_keyboard: [
+            [{ text: '🌍 Tüm Oyunlar',    callback_data: 'kg_all'      }],
+            [{ text: '🌾 Kukirin',         callback_data: 'kg_kukirin'  }],
+            [{ text: '🔧 Build & Weld',    callback_data: 'kg_buildweld'}],
+            [{ text: '🏙️ San Diego RP',   callback_data: 'kg_sdrp'    }],
+            [{ text: '◀ Geri',            callback_data: 'panel_key'   }],
+        ]}}
+    );
+}
+
+async function generateKey(id, msgId, sure, rank, game) {
+    const prefix = keyPrefix(sure);
+    const keyStr = randomKey(prefix);
+    const expMs  = expireMs(sure);
+    keys[keyStr] = {
+        rank,
+        game,
+        expire: expMs ? Date.now() + expMs : null,
+        used: false,
+        usedBy: null,
+    };
+    sessions[id] = {};
+    await edit(id, msgId,
+        `✅ <b>Key Oluşturuldu!</b>\n\n` +
+        `🔑 <code>${keyStr}</code>\n\n` +
+        `⏳ Süre: ${sure}\n` +
+        `🎖 Rank: ${rankLabel(rank)}\n` +
+        `🎮 Oyun: ${gameLabel(game)}\n\n` +
+        `Kopyalamak için koda tıkla.`,
+        { reply_markup: { inline_keyboard: [
+            [{ text: '◀ Panele Dön', callback_data: 'panel_back' }],
+        ]}}
+    );
+}
+
+// ══════════════════════════════════════
+// CALLBACK HANDLER
+// ══════════════════════════════════════
+async function handleCallback(cb) {
+    const id    = cb.from.id;
+    const data  = cb.data;
+    const msgId = cb.message.message_id;
+    const uname = cb.from.username || cb.from.first_name || String(id);
+    const sess  = sessions[id] || {};
+
+    await tg('answerCallbackQuery', { callback_query_id: cb.id });
+
+    // — Auth akışı —
+    if (data === 'auth_register' || data === 'auth_login') {
+        sessions[id] = { step: 'await_password', action: data, username: uname, pwMsgId: msgId };
+        const m = await send(id, '🔒 Lütfen şifreyi gir:');
+        sessions[id].promptMsgId = m.result.message_id;
+        return;
+    }
+
+    // — Panel navigasyon —
+    if (data === 'panel_back') return showPanel(id, uname);
+    if (data === 'panel_key')  return startKeyFlow(id, msgId);
+
+    if (data === 'panel_profile') {
+        const u = users[id];
+        return edit(id, msgId,
+            `👤 <b>Profil</b>\n\n` +
+            `Kullanıcı: @${uname}\n` +
+            `Rank: ${rankLabel(u ? u.rank : 'USER')}\n` +
+            `Kayıt: ✅`,
+            { reply_markup: { inline_keyboard: [[{ text: '◀ Geri', callback_data: 'panel_back' }]] }}
+        );
+    }
+
+    if (data === 'panel_announce') {
+        if (!isAdmin(id)) return send(id, '❌ Yetersiz yetki.');
+        sessions[id] = { step: 'await_announce', msgId };
+        return send(id, '📢 Duyuru metnini gir (veya "temizle" yaz):');
+    }
+
+    if (data === 'panel_admin') {
+        if (!isAdmin(id)) return send(id, '❌ Yetersiz yetki.');
+        return edit(id, msgId,
+            `⚙️ <b>Yönetim Paneli</b>\n\n` +
+            `🔧 Bakım: ${maintenance ? '🔴 Aktif' : '🟢 Kapalı'}`,
+            { reply_markup: { inline_keyboard: [
+                [{ text: maintenance ? '🟢 Bakımı Kapat' : '🔴 Bakımı Aç', callback_data: 'admin_maint' }],
+                [{ text: '◀ Geri', callback_data: 'panel_back' }],
             ]}}
         );
-        return res.send("ok");
     }
 
-    // /menu
-    if(lower==="/menu"){
-        if(!users[userId]){
-            await send(chatId,
-                `👋 <b>NEXUS HUB Yönetim Paneli</b>\n\n`+
-                `👤 @${username}\n\nDevam etmek için seç:`,
-                {reply_markup:{inline_keyboard:[
-                    [{text:"📝  Kayıt Ol",  callback_data:"kayit_ol"}],
-                    [{text:"🔐  Giriş Yap", callback_data:"giris_yap"}],
-                ]}}
-            );
-            return res.send("ok");
+    if (data === 'admin_maint') {
+        if (!isAdmin(id)) return send(id, '❌ Yetersiz yetki.');
+        maintenance = !maintenance;
+        return edit(id, msgId,
+            `⚙️ <b>Yönetim Paneli</b>\n\n🔧 Bakım: ${maintenance ? '🔴 Aktif' : '🟢 Kapalı'}`,
+            { reply_markup: { inline_keyboard: [
+                [{ text: maintenance ? '🟢 Bakımı Kapat' : '🔴 Bakımı Aç', callback_data: 'admin_maint' }],
+                [{ text: '◀ Geri', callback_data: 'panel_back' }],
+            ]}}
+        );
+    }
+
+    // — Key akışı: süre —
+    if (data.startsWith('ks_')) return keyRankStep(id, msgId, data.slice(3));
+    // — Key akışı: rank —
+    if (data.startsWith('kr_')) return keyGameStep(id, msgId, sess.sure, data.slice(3));
+    // — Key akışı: oyun —
+    if (data.startsWith('kg_')) return generateKey(id, msgId, sess.sure, sess.rank, data.slice(3));
+}
+
+// ══════════════════════════════════════
+// MESAJ HANDLER
+// ══════════════════════════════════════
+async function handleMessage(msg) {
+    const id    = msg.from.id;
+    const text  = (msg.text || '').trim();
+    const uname = msg.from.username || msg.from.first_name || String(id);
+    const sess  = sessions[id] || {};
+
+    // Komutlar
+    if (text === '/start' || text === '/menu') return handleStart(msg);
+
+    if (text.startsWith('/yetkiver ')) {
+        if (!isAdmin(id)) return send(id, '❌ Yetersiz yetki.');
+        const parts = text.split(' ');
+        const target = parts[1]?.replace('@','');
+        const rank   = parts[2]?.toUpperCase();
+        const found  = Object.entries(users).find(([,u]) => u.username === target);
+        if (!found) return send(id, '❌ Kullanıcı bulunamadı.');
+        found[1].rank = rank;
+        return send(id, `✅ @${target} → ${rankLabel(rank)}`);
+    }
+
+    if (text.startsWith('/yasakla ')) {
+        if (!isAdmin(id)) return send(id, '❌ Yetersiz yetki.');
+        const target = text.split(' ')[1]?.replace('@','');
+        const found  = Object.entries(users).find(([,u]) => u.username === target);
+        if (!found) return send(id, '❌ Bulunamadı.');
+        found[1].banned = true;
+        return send(id, `🚫 @${target} yasaklandı.`);
+    }
+
+    if (text.startsWith('/yasakkalk ')) {
+        if (!isAdmin(id)) return send(id, '❌ Yetersiz yetki.');
+        const target = text.split(' ')[1]?.replace('@','');
+        const found  = Object.entries(users).find(([,u]) => u.username === target);
+        if (!found) return send(id, '❌ Bulunamadı.');
+        found[1].banned = false;
+        return send(id, `✅ @${target} yasağı kalktı.`);
+    }
+
+    if (text.startsWith('/delkey ')) {
+        if (!isMod(id)) return send(id, '❌ Yetersiz yetki.');
+        const k = text.split(' ')[1];
+        if (!keys[k]) return send(id, '❌ Key bulunamadı.');
+        delete keys[k];
+        return send(id, `🗑 Key silindi: <code>${k}</code>`);
+    }
+
+    if (text.startsWith('/maintenance ')) {
+        if (!isAdmin(id)) return send(id, '❌ Yetersiz yetki.');
+        const val = text.split(' ')[1];
+        maintenance = val === 'on';
+        return send(id, `🔧 Bakım modu: ${maintenance ? '🔴 Aktif' : '🟢 Kapalı'}`);
+    }
+
+    // Oturum adımları
+    if (sess.step === 'await_password') {
+        await deleteMsg(id, msg.message_id);
+        if (sess.promptMsgId) await deleteMsg(id, sess.promptMsgId);
+
+        if (text !== ADMIN_PW) {
+            sessions[id] = {};
+            return send(id, '❌ Yanlış şifre!');
         }
-        if(users[userId].banned){await send(chatId,"⛔ Erişimin engellendi.");return res.send("ok");}
-        await send(chatId,panelText(userId),{reply_markup:anaMenu()});
-        return res.send("ok");
+        users[id] = { username: uname, rank: String(id) === String(ADMIN_ID) ? 'OWNER' : 'USER', banned: false, registered: true };
+        sessions[id] = {};
+        return showPanel(id, uname);
     }
 
-    if(!users[userId]){await send(chatId,"❌ /start ile giriş yap.");return res.send("ok");}
-    if(users[userId].banned){await send(chatId,"⛔ Erişimin engellendi.");return res.send("ok");}
+    if (sess.step === 'await_announce') {
+        announcementMsg = text === 'temizle' ? '' : text;
+        sessions[id] = {};
+        return send(id, text === 'temizle' ? '✅ Duyuru temizlendi.' : `✅ Duyuru ayarlandı:\n${text}`);
+    }
+}
 
-    if(lower==="/benim"){
-        const u=users[userId];
-        await send(chatId,
-            `👤 <b>Profilim</b>\n\n`+
-            `Kullanıcı: @${u.username}\n`+
-            `${rankEmoji(u.rank)} Rank: <b>${u.rank}</b>\n`+
-            `📅 Kayıt: ${new Date(u.registeredAt*1000).toLocaleDateString("tr-TR")}`
-        );
-        return res.send("ok");
+// ══════════════════════════════════════
+// WEBHOOK
+// ══════════════════════════════════════
+app.post('/webhook', async (req, res) => {
+    res.sendStatus(200);
+    const update = req.body;
+    try {
+        if (update.message)        await handleMessage(update.message);
+        if (update.callback_query) await handleCallback(update.callback_query);
+    } catch (e) {
+        console.error('[NEXUS]', e.message);
     }
-    if(lower.startsWith("/delkey")){
-        if(!hasPerm(userId,"delkey")){await send(chatId,"❌ Yetkin yok.");return res.send("ok");}
-        const key=text.split(" ")[1]?.toUpperCase();
-        if(!key||!keys[key]){await send(chatId,"❌ Key bulunamadı.");return res.send("ok");}
-        delete keys[key];
-        await send(chatId,`🗑️ Silindi: <code>${key}</code>`);
-        return res.send("ok");
-    }
-    if(lower.startsWith("/yetkiver")){
-        if(!hasPerm(userId,"yetkiver")){await send(chatId,"❌ Yetkin yok.");return res.send("ok");}
-        const p=text.split(" ");const target=p[1]?.replace("@","");const newRank=p[2]?.toUpperCase();
-        if(!target||!newRank||!RANKS.includes(newRank)){await send(chatId,"❌ /yetkiver @kullanici MOD|ADMIN|OWNER");return res.send("ok");}
-        const found=Object.entries(users).find(([,u2])=>u2.username===target);
-        if(!found){await send(chatId,"❌ Kullanıcı bulunamadı.");return res.send("ok");}
-        users[found[0]].rank=newRank;
-        await send(chatId,`✅ @${target} → ${rankEmoji(newRank)} <b>${newRank}</b>`);
-        return res.send("ok");
-    }
-    if(lower.startsWith("/yasakla")){
-        if(!hasPerm(userId,"yasakla")){await send(chatId,"❌ Yetkin yok.");return res.send("ok");}
-        const target=text.split(" ")[1]?.replace("@","");
-        if(!target){await send(chatId,"❌ /yasakla @kullanici");return res.send("ok");}
-        const found=Object.entries(users).find(([,u2])=>u2.username===target);
-        if(!found){await send(chatId,"❌ Kullanıcı bulunamadı.");return res.send("ok");}
-        users[found[0]].banned=true;
-        await send(chatId,`⛔ @${target} yasaklandı.`);
-        return res.send("ok");
-    }
-    if(lower.startsWith("/yasakkalk")){
-        if(!hasPerm(userId,"yasakla")){await send(chatId,"❌ Yetkin yok.");return res.send("ok");}
-        const target=text.split(" ")[1]?.replace("@","");
-        if(!target){await send(chatId,"❌ /yasakkalk @kullanici");return res.send("ok");}
-        const found=Object.entries(users).find(([,u2])=>u2.username===target);
-        if(!found){await send(chatId,"❌ Kullanıcı bulunamadı.");return res.send("ok");}
-        users[found[0]].banned=false;
-        await send(chatId,`✅ @${target} yasağı kaldırıldı.`);
-        return res.send("ok");
-    }
-    if(lower.startsWith("/maintenance")){
-        if(!hasPerm(userId,"maintenance")){await send(chatId,"❌ Yetkin yok.");return res.send("ok");}
-        const p=text.split(" ");const mode=p[1]?.toLowerCase();const m=p.slice(2).join(" ")||"Bakım yapılıyor...";
-        if(mode==="on"){
-            maintenance={active:true,msg:m};
-            announcement={active:true,msg:"🔧 BAKIM MODUNDADIR — EN YAKIN ZAMANDA AÇILACAKTIR"};
-            await send(chatId,`🔧 Bakım AÇIK\n📝 ${m}`);
-        }else if(mode==="off"){
-            maintenance={active:false,msg:""};
-            announcement={active:false,msg:""};
-            await send(chatId,"✅ Bakım KAPALI");
-        }else await send(chatId,"/maintenance on [mesaj]\n/maintenance off");
-        return res.send("ok");
-    }
-    if(lower==="/help"||lower==="/yardim"){
-        await send(chatId,
-            `🤖 <b>NEXUS HUB Komutlar</b>\n\n`+
-            `🏠 /menu — Ana panel\n`+
-            `👤 /benim — Profilim\n`+
-            `🗑️ /delkey [KEY] — Key sil\n`+
-            `🛡️ /yetkiver @ad RANK — Yetki ver\n`+
-            `⛔ /yasakla @ad — Yasakla\n`+
-            `✅ /yasakkalk @ad — Yasak kaldır\n`+
-            `🔧 /maintenance on|off\n\n`+
-            `📱 @NexusOfficiall  •  🛒 @NexusStoreOfficiall`
-        );
-        return res.send("ok");
-    }
-
-    await send(chatId,"❓ /menu yaz.");
-    res.send("ok");
 });
 
-app.get("/ping",(req,res)=>{
+// ══════════════════════════════════════
+// ENDPOINTS
+// ══════════════════════════════════════
+app.get('/ping', (req, res) => {
     res.json({
-        status:maintenance.active?"maintenance":"online",
-        msg:maintenance.msg,
-        announcement:announcement.active,
-        announcementMsg:announcement.msg
+        status: maintenance ? 'maintenance' : 'ok',
+        msg: maintenance ? 'maintenance' : 'online',
+        announcement: !!announcementMsg,
+        announcementMsg,
     });
 });
-app.get("/check",(req,res)=>{
-    if(maintenance.active)return res.json({status:"maintenance",msg:maintenance.msg});
-    const key=req.query.key?.toUpperCase();
-    if(!key)return res.json({status:"error"});
-    const data=keys[key];
-    if(!data)return res.json({status:"invalid"});
-    if(data.expire!==0&&data.expire<Date.now()/1000)return res.json({status:"expired"});
-    res.json({status:"valid",rank:data.rank,game:data.game||"all",expire:data.expire});
+
+app.get('/check', (req, res) => {
+    const keyStr = req.query.key;
+    if (!keyStr || !keys[keyStr]) return res.json({ status: 'invalid' });
+    const k = keys[keyStr];
+    if (k.expire && Date.now() > k.expire) return res.json({ status: 'expired' });
+    res.json({ status: 'ok', rank: k.rank, game: k.game, expire: k.expire });
 });
-app.get("/",(req,res)=>res.send("NEXUS HUB — Online ✅"));
-app.listen(3000,()=>console.log("NEXUS HUB çalışıyor 🚀"));
+
+app.get('/', (req, res) => res.send('NEXUS HUB — Online'));
+
+app.listen(PORT, () => console.log(`[NEXUS] Port ${PORT} aktif`));
