@@ -1,8 +1,7 @@
 // ═══════════════════════════════════════════════════════════════
-//  NEXUS HUB — Telegram Bot + Key API Server
+//  NEXUS HUB v2.1 — Telegram Bot + Key API Server
 //  Built by Olivia — https://discord.gg/ojailbreaks
-//  Owner: Olivia (ADMIN_ID env)
-//  Fixed owner password — no registration
+//  Kullanıcı bazlı giriş sistemi
 // ═══════════════════════════════════════════════════════════════
 
 const express = require("express");
@@ -13,27 +12,37 @@ app.use(express.json());
 // ─── ENV ────────────────────────────────────────────────────
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const ADMIN_ID = process.env.ADMIN_ID || "8961529079";
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "nexus2024";
 const PORT = process.env.PORT || 3000;
 const API = `https://api.telegram.org/bot${BOT_TOKEN}`;
 
 // ─── IN-MEMORY STATE ────────────────────────────────────────
-let keys = {};           // key -> { status, rank, game, expire, createdBy, createdAt }
+// users: chatId -> { username, password, rank, createdAt, createdBy }
+// OWNER auto-seeded on first /start from ADMIN_ID
+let users = {};
+let keys = {};
 let sessions = {};       // chatId -> { authed, rank, lastActivity, loginAttempts, lockedUntil }
-let activityLog = [];    // { time, chatId, username, action, detail }
+let activityLog = [];
 let maintenance = false;
 let announcement = "";
-let bannedUsers = {};    // chatId -> { reason, bannedAt, bannedBy }
-let securityAlerts = []; // { time, chatId, username, type, detail }
+let bannedUsers = {};
+let securityAlerts = [];
+
+// ─── SEED OWNER ─────────────────────────────────────────────
+// Owner is auto-registered when they first /start the bot
+function seedOwner(chatId, tgUsername) {
+  if (!users[chatId]) {
+    users[chatId] = {
+      username: tgUsername || "owner",
+      password: null, // owner uses Telegram ID auth, no password needed
+      rank: "OWNER",
+      createdAt: new Date().toISOString(),
+      createdBy: "SYSTEM",
+    };
+  }
+}
 
 // ─── RANK PERMISSIONS ───────────────────────────────────────
-const RANKS = {
-  OWNER: 4,
-  ADMIN: 3,
-  MOD: 2,
-  USER: 1,
-};
-
+const RANKS = { OWNER: 4, ADMIN: 3, MOD: 2, USER: 1 };
 function rankLevel(r) { return RANKS[r] || 0; }
 
 // ─── SECURITY ───────────────────────────────────────────────
@@ -44,69 +53,47 @@ const SESSION_TIMEOUT_MINUTES = 120;
 function getSession(chatId) {
   if (!sessions[chatId]) {
     sessions[chatId] = {
-      authed: false,
-      rank: null,
-      lastActivity: 0,
-      loginAttempts: 0,
-      lockedUntil: 0,
+      authed: false, rank: null, lastActivity: 0,
+      loginAttempts: 0, lockedUntil: 0,
     };
   }
   return sessions[chatId];
 }
 
-function isLocked(session) {
-  if (session.lockedUntil && Date.now() < session.lockedUntil) return true;
-  if (session.lockedUntil && Date.now() >= session.lockedUntil) {
-    session.loginAttempts = 0;
-    session.lockedUntil = 0;
+function isLocked(s) {
+  if (s.lockedUntil && Date.now() < s.lockedUntil) return true;
+  if (s.lockedUntil && Date.now() >= s.lockedUntil) {
+    s.loginAttempts = 0; s.lockedUntil = 0;
   }
   return false;
 }
 
-function isSessionExpired(session) {
-  if (!session.authed) return true;
-  if (Date.now() - session.lastActivity > SESSION_TIMEOUT_MINUTES * 60 * 1000) {
-    session.authed = false;
-    session.rank = null;
-    return true;
+function isSessionExpired(s) {
+  if (!s.authed) return true;
+  if (Date.now() - s.lastActivity > SESSION_TIMEOUT_MINUTES * 60000) {
+    s.authed = false; s.rank = null; return true;
   }
   return false;
 }
 
-function touchSession(session) {
-  session.lastActivity = Date.now();
-}
+function touchSession(s) { s.lastActivity = Date.now(); }
 
 function logActivity(chatId, username, action, detail = "") {
-  const entry = {
-    time: new Date().toISOString(),
-    chatId: String(chatId),
-    username: username || "unknown",
-    action,
-    detail,
-  };
-  activityLog.push(entry);
+  activityLog.push({ time: new Date().toISOString(), chatId: String(chatId), username: username || "?", action, detail });
   if (activityLog.length > 500) activityLog.shift();
 }
 
 function logSecurity(chatId, username, type, detail = "") {
-  const entry = {
-    time: new Date().toISOString(),
-    chatId: String(chatId),
-    username: username || "unknown",
-    type,
-    detail,
-  };
+  const entry = { time: new Date().toISOString(), chatId: String(chatId), username: username || "?", type, detail };
   securityAlerts.push(entry);
   if (securityAlerts.length > 200) securityAlerts.shift();
-  // notify owner on critical events
   if (type === "BRUTE_FORCE" || type === "BANNED_ACCESS") {
-    send(ADMIN_ID, `🚨 *GÜVENLİK ALARMI*\n\nTip: \`${type}\`\nKullanıcı: @${username || "?"} (${chatId})\nDetay: ${detail}\nZaman: ${entry.time}`, { parse_mode: "Markdown" });
+    send(ADMIN_ID, `🚨 *GÜVENLİK ALARMI*\n\nTip: \`${type}\`\nKullanıcı: @${username || "?"} (${chatId})\nDetay: ${detail}`, { parse_mode: "Markdown" });
   }
 }
 
 // ─── GENERATE KEY ───────────────────────────────────────────
-function generateKey(duration, rank, game) {
+function generateKey(duration, rank, game, createdBy) {
   const hex = crypto.randomBytes(3).toString("hex").toUpperCase();
   const tag = duration.toUpperCase();
   const key = `NEXUS-${tag}-${hex}`;
@@ -115,14 +102,7 @@ function generateKey(duration, rank, game) {
   if (tag === "DAY") expire = now + 86400000;
   else if (tag === "WEEK") expire = now + 604800000;
   else if (tag === "MONTH") expire = now + 2592000000;
-  // PERM = 0 means no expiry
-  keys[key] = {
-    status: "ok",
-    rank: rank || "USER",
-    game: game || "all",
-    expire,
-    createdAt: new Date().toISOString(),
-  };
+  keys[key] = { status: "ok", rank: rank || "USER", game: game || "all", expire, createdAt: new Date().toISOString(), createdBy };
   return key;
 }
 
@@ -130,34 +110,31 @@ function generateKey(duration, rank, game) {
 async function send(chatId, text, extra = {}) {
   try {
     await fetch(`${API}/sendMessage`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
+      method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ chat_id: chatId, text, ...extra }),
     });
-  } catch (e) { console.error("send error:", e.message); }
+  } catch (e) { console.error("send:", e.message); }
 }
 
-async function editMessage(chatId, msgId, text, extra = {}) {
+async function editMsg(chatId, msgId, text, extra = {}) {
   try {
     await fetch(`${API}/editMessageText`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
+      method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ chat_id: chatId, message_id: msgId, text, ...extra }),
     });
-  } catch (e) { console.error("edit error:", e.message); }
+  } catch (e) { console.error("edit:", e.message); }
 }
 
-async function answerCallback(callbackId, text = "") {
+async function answerCb(cbId, text = "") {
   try {
     await fetch(`${API}/answerCallbackQuery`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ callback_query_id: callbackId, text }),
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ callback_query_id: cbId, text }),
     });
   } catch (e) {}
 }
 
-// ─── INLINE KEYBOARDS ──────────────────────────────────────
+// ─── KEYBOARDS ──────────────────────────────────────────────
 function mainMenu(rank) {
   const rows = [
     [{ text: "🔑 Key Oluştur", callback_data: "key_create" }],
@@ -168,8 +145,12 @@ function mainMenu(rank) {
     rows.push([{ text: "📊 Aktivite Logu", callback_data: "view_activity" }]);
     rows.push([{ text: "🚨 Güvenlik Logları", callback_data: "view_security" }]);
     rows.push([{ text: "👥 Aktif Oturumlar", callback_data: "view_sessions" }]);
+    rows.push([{ text: "👤 Kullanıcılar", callback_data: "view_users" }]);
   }
   if (rankLevel(rank) >= RANKS.OWNER) {
+    rows.push([{ text: "➕ Kullanıcı Ekle", callback_data: "add_user_prompt" }]);
+    rows.push([{ text: "🗑 Kullanıcı Sil", callback_data: "del_user_prompt" }]);
+    rows.push([{ text: "🎖 Rank Değiştir", callback_data: "change_rank_prompt" }]);
     rows.push([
       { text: "🔧 Bakım Modu", callback_data: "toggle_maintenance" },
       { text: "📢 Duyuru", callback_data: "set_announce" },
@@ -183,258 +164,218 @@ function mainMenu(rank) {
   return { inline_keyboard: rows };
 }
 
-function durationKeyboard() {
-  return {
-    inline_keyboard: [
-      [
-        { text: "⏱ Günlük", callback_data: "dur_DAY" },
-        { text: "📅 Haftalık", callback_data: "dur_WEEK" },
-      ],
-      [
-        { text: "🗓 Aylık", callback_data: "dur_MONTH" },
-        { text: "♾ Süresiz", callback_data: "dur_PERM" },
-      ],
-    ],
-  };
+function durationKb() {
+  return { inline_keyboard: [
+    [{ text: "⏱ Günlük", callback_data: "dur_DAY" }, { text: "📅 Haftalık", callback_data: "dur_WEEK" }],
+    [{ text: "🗓 Aylık", callback_data: "dur_MONTH" }, { text: "♾ Süresiz", callback_data: "dur_PERM" }],
+  ]};
 }
 
-function rankKeyboard() {
-  return {
-    inline_keyboard: [
-      [
-        { text: "👤 USER", callback_data: "rank_USER" },
-        { text: "🛡 MOD", callback_data: "rank_MOD" },
-      ],
-      [
-        { text: "⚡ ADMIN", callback_data: "rank_ADMIN" },
-        { text: "👑 OWNER", callback_data: "rank_OWNER" },
-      ],
-    ],
-  };
+function rankKb() {
+  return { inline_keyboard: [
+    [{ text: "👤 USER", callback_data: "rank_USER" }, { text: "🛡 MOD", callback_data: "rank_MOD" }],
+    [{ text: "⚡ ADMIN", callback_data: "rank_ADMIN" }, { text: "👑 OWNER", callback_data: "rank_OWNER" }],
+  ]};
 }
 
-function gameKeyboard() {
-  return {
-    inline_keyboard: [
-      [{ text: "🌍 Tüm Oyunlar", callback_data: "game_all" }],
-      [{ text: "🌾 Kukirin", callback_data: "game_kukirin" }],
-      [{ text: "🔧 Build & Weld", callback_data: "game_buildweld" }],
-      [{ text: "🏙️ San Diego RP", callback_data: "game_sdrp" }],
-    ],
-  };
+function gameKb() {
+  return { inline_keyboard: [
+    [{ text: "🌍 Tüm Oyunlar", callback_data: "game_all" }],
+    [{ text: "🌾 Kukirin", callback_data: "game_kukirin" }],
+    [{ text: "🔧 Build & Weld", callback_data: "game_buildweld" }],
+    [{ text: "🏙️ San Diego RP", callback_data: "game_sdrp" }],
+  ]};
 }
 
-// ─── PENDING STATE PER CHAT ─────────────────────────────────
-let pendingAction = {}; // chatId -> { step, duration, rank, game, ... }
+// ─── PENDING STATE ──────────────────────────────────────────
+let pending = {};
 
-// ─── WEBHOOK HANDLER ────────────────────────────────────────
+// ─── WEBHOOK ────────────────────────────────────────────────
 app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
   res.sendStatus(200);
   const body = req.body;
 
-  // ── CALLBACK QUERIES ──
+  // ── CALLBACKS ──
   if (body.callback_query) {
     const cb = body.callback_query;
     const chatId = cb.message.chat.id;
     const msgId = cb.message.message_id;
     const data = cb.data;
-    const username = cb.from.username || cb.from.first_name || "?";
+    const tgUser = cb.from.username || cb.from.first_name || "?";
     const session = getSession(chatId);
 
-    await answerCallback(cb.id);
+    await answerCb(cb.id);
 
-    // must be authed for everything except nothing
     if (!session.authed || isSessionExpired(session)) {
       if (data !== "logout") {
-        await send(chatId, "⚠️ Oturum süresi dolmuş. Tekrar giriş yapın: /login <şifre>");
+        await send(chatId, "⚠️ Oturum dolmuş. /login <kullanıcıadı> <şifre>");
         return;
       }
     }
     touchSession(session);
 
-    // ── LOGOUT ──
+    // LOGOUT
     if (data === "logout") {
-      session.authed = false;
-      session.rank = null;
-      logActivity(chatId, username, "LOGOUT");
+      session.authed = false; session.rank = null;
+      logActivity(chatId, tgUser, "LOGOUT");
       await send(chatId, "🔒 Çıkış yapıldı.");
       return;
     }
 
     // ── KEY CREATE FLOW ──
     if (data === "key_create") {
-      pendingAction[chatId] = { step: "duration" };
-      logActivity(chatId, username, "KEY_CREATE_START");
-      await editMessage(chatId, msgId, "⏱ *Key Süresi Seçin:*", {
-        parse_mode: "Markdown",
-        reply_markup: JSON.stringify(durationKeyboard()),
-      });
+      if (rankLevel(session.rank) < RANKS.MOD) {
+        await send(chatId, "⛔ Key oluşturma yetkiniz yok. Minimum rank: MOD");
+        return;
+      }
+      pending[chatId] = { step: "duration" };
+      logActivity(chatId, tgUser, "KEY_CREATE_START");
+      await editMsg(chatId, msgId, "⏱ *Key Süresi Seçin:*", { parse_mode: "Markdown", reply_markup: JSON.stringify(durationKb()) });
       return;
     }
-
     if (data.startsWith("dur_")) {
-      const dur = data.replace("dur_", "");
-      if (!pendingAction[chatId]) return;
-      pendingAction[chatId].duration = dur;
-      pendingAction[chatId].step = "rank";
-      await editMessage(chatId, msgId, "🎖 *Rank Seçin:*", {
-        parse_mode: "Markdown",
-        reply_markup: JSON.stringify(rankKeyboard()),
-      });
+      if (!pending[chatId]) return;
+      pending[chatId].duration = data.replace("dur_", "");
+      pending[chatId].step = "rank";
+      await editMsg(chatId, msgId, "🎖 *Rank Seçin:*", { parse_mode: "Markdown", reply_markup: JSON.stringify(rankKb()) });
       return;
     }
-
     if (data.startsWith("rank_")) {
-      const rnk = data.replace("rank_", "");
-      if (!pendingAction[chatId]) return;
-      pendingAction[chatId].rank = rnk;
-      pendingAction[chatId].step = "game";
-      await editMessage(chatId, msgId, "🎮 *Oyun Seçin:*", {
-        parse_mode: "Markdown",
-        reply_markup: JSON.stringify(gameKeyboard()),
-      });
+      if (!pending[chatId]) return;
+      pending[chatId].rank = data.replace("rank_", "");
+      pending[chatId].step = "game";
+      await editMsg(chatId, msgId, "🎮 *Oyun Seçin:*", { parse_mode: "Markdown", reply_markup: JSON.stringify(gameKb()) });
       return;
     }
-
     if (data.startsWith("game_")) {
+      if (!pending[chatId]) return;
+      const p = pending[chatId];
       const gm = data.replace("game_", "");
-      if (!pendingAction[chatId]) return;
-      const p = pendingAction[chatId];
-      const key = generateKey(p.duration, p.rank, gm);
-      delete pendingAction[chatId];
-      logActivity(chatId, username, "KEY_CREATED", `${key} | ${p.rank} | ${gm} | ${p.duration}`);
-      await editMessage(chatId, msgId,
-        `✅ *Key Oluşturuldu!*\n\n` +
-        `🔑 Key: \`${key}\`\n` +
-        `⏱ Süre: *${p.duration}*\n` +
-        `🎖 Rank: *${p.rank}*\n` +
-        `🎮 Oyun: *${gm}*\n\n` +
-        `📋 Kopyalamak için key'e dokunun.`,
-        { parse_mode: "Markdown", reply_markup: JSON.stringify(mainMenu(session.rank)) }
-      );
+      const key = generateKey(p.duration, p.rank, gm, tgUser);
+      delete pending[chatId];
+      logActivity(chatId, tgUser, "KEY_CREATED", `${key} | ${p.rank} | ${gm} | ${p.duration}`);
+      await editMsg(chatId, msgId,
+        `✅ *Key Oluşturuldu!*\n\n🔑 \`${key}\`\n⏱ ${p.duration} | 🎖 ${p.rank} | 🎮 ${gm}\n\n📋 Kopyalamak için dokunun.`,
+        { parse_mode: "Markdown", reply_markup: JSON.stringify(mainMenu(session.rank)) });
       return;
     }
 
-    // ── KEY LIST ──
+    // KEY LIST
     if (data === "key_list") {
       const entries = Object.entries(keys).filter(([, v]) => v.status === "ok");
-      if (entries.length === 0) {
-        await editMessage(chatId, msgId, "📋 Aktif key bulunamadı.", {
-          reply_markup: JSON.stringify(mainMenu(session.rank)),
-        });
+      if (!entries.length) {
+        await editMsg(chatId, msgId, "📋 Aktif key yok.", { reply_markup: JSON.stringify(mainMenu(session.rank)) });
         return;
       }
       let txt = "📋 *Aktif Keyler:*\n\n";
       for (const [k, v] of entries) {
-        const exp = v.expire ? new Date(v.expire).toLocaleDateString("tr-TR") : "♾ Süresiz";
-        txt += `🔑 \`${k}\`\n   Rank: ${v.rank} | Oyun: ${v.game} | Bitiş: ${exp}\n\n`;
+        const exp = v.expire ? new Date(v.expire).toLocaleDateString("tr-TR") : "♾";
+        txt += `🔑 \`${k}\`\n   ${v.rank} | ${v.game} | ${exp} | by ${v.createdBy || "?"}\n\n`;
       }
-      logActivity(chatId, username, "KEY_LIST_VIEW");
-      await editMessage(chatId, msgId, txt, {
-        parse_mode: "Markdown",
-        reply_markup: JSON.stringify(mainMenu(session.rank)),
-      });
+      logActivity(chatId, tgUser, "KEY_LIST");
+      await editMsg(chatId, msgId, txt, { parse_mode: "Markdown", reply_markup: JSON.stringify(mainMenu(session.rank)) });
       return;
     }
 
-    // ── KEY DELETE PROMPT ──
+    // KEY DELETE
     if (data === "key_delete_prompt") {
-      pendingAction[chatId] = { step: "delete_key" };
-      await editMessage(chatId, msgId, "❌ Silmek istediğiniz key'i yazın:");
+      pending[chatId] = { step: "delete_key" };
+      await editMsg(chatId, msgId, "❌ Silmek istediğiniz key'i yazın:");
       return;
     }
 
-    // ── TOGGLE MAINTENANCE ──
+    // VIEW USERS
+    if (data === "view_users") {
+      const userList = Object.entries(users);
+      if (!userList.length) {
+        await editMsg(chatId, msgId, "👤 Kayıtlı kullanıcı yok.", { reply_markup: JSON.stringify(mainMenu(session.rank)) });
+        return;
+      }
+      let txt = "👤 *Kayıtlı Kullanıcılar:*\n\n";
+      for (const [id, u] of userList) {
+        txt += `🔹 \`${id}\` — @${u.username} — *${u.rank}*\n`;
+      }
+      logActivity(chatId, tgUser, "VIEW_USERS");
+      await editMsg(chatId, msgId, txt, { parse_mode: "Markdown", reply_markup: JSON.stringify(mainMenu(session.rank)) });
+      return;
+    }
+
+    // ADD USER PROMPT
+    if (data === "add_user_prompt") {
+      pending[chatId] = { step: "add_user" };
+      await editMsg(chatId, msgId, "➕ Yeni kullanıcı bilgilerini yazın:\n\n`<chatID> <kullanıcıadı> <şifre>`\n\nÖrnek: `123456789 ahmet sifre123`", { parse_mode: "Markdown" });
+      return;
+    }
+
+    // DELETE USER PROMPT
+    if (data === "del_user_prompt") {
+      pending[chatId] = { step: "del_user" };
+      await editMsg(chatId, msgId, "🗑 Silmek istediğiniz kullanıcının Chat ID'sini yazın:");
+      return;
+    }
+
+    // CHANGE RANK PROMPT
+    if (data === "change_rank_prompt") {
+      pending[chatId] = { step: "change_rank" };
+      await editMsg(chatId, msgId, "🎖 Rank değiştirmek için yazın:\n\n`<chatID> <yeniRank>`\n\nÖrnek: `123456789 ADMIN`\nRanklar: USER, MOD, ADMIN, OWNER", { parse_mode: "Markdown" });
+      return;
+    }
+
+    // MAINTENANCE
     if (data === "toggle_maintenance") {
       maintenance = !maintenance;
-      logActivity(chatId, username, "MAINTENANCE_TOGGLE", maintenance ? "ON" : "OFF");
-      await editMessage(chatId, msgId, `🔧 Bakım Modu: ${maintenance ? "✅ AKTİF" : "❌ KAPALI"}`, {
-        reply_markup: JSON.stringify(mainMenu(session.rank)),
-      });
+      logActivity(chatId, tgUser, "MAINTENANCE", maintenance ? "ON" : "OFF");
+      await editMsg(chatId, msgId, `🔧 Bakım: ${maintenance ? "✅ AKTİF" : "❌ KAPALI"}`, { reply_markup: JSON.stringify(mainMenu(session.rank)) });
       return;
     }
 
-    // ── SET ANNOUNCE PROMPT ──
+    // ANNOUNCE
     if (data === "set_announce") {
-      pendingAction[chatId] = { step: "announce" };
-      await editMessage(chatId, msgId, "📢 Duyuru metnini yazın (sıfırlamak için 'sil' yazın):");
+      pending[chatId] = { step: "announce" };
+      await editMsg(chatId, msgId, "📢 Duyuru yazın ('sil' = sıfırla):");
       return;
     }
 
-    // ── BAN PROMPT ──
+    // BAN/UNBAN
     if (data === "ban_prompt") {
-      pendingAction[chatId] = { step: "ban_id" };
-      await editMessage(chatId, msgId, "🚫 Banlamak istediğiniz kullanıcının Chat ID'sini yazın:");
+      pending[chatId] = { step: "ban_id" };
+      await editMsg(chatId, msgId, "🚫 Banlanacak Chat ID:");
       return;
     }
-
-    // ── UNBAN PROMPT ──
     if (data === "unban_prompt") {
-      pendingAction[chatId] = { step: "unban_id" };
-      await editMessage(chatId, msgId, "✅ Unban yapmak istediğiniz Chat ID'yi yazın:");
+      pending[chatId] = { step: "unban_id" };
+      await editMsg(chatId, msgId, "✅ Unban Chat ID:");
       return;
     }
 
-    // ── VIEW ACTIVITY ──
+    // ACTIVITY LOG
     if (data === "view_activity") {
       const last20 = activityLog.slice(-20).reverse();
-      if (last20.length === 0) {
-        await editMessage(chatId, msgId, "📊 Henüz aktivite yok.", {
-          reply_markup: JSON.stringify(mainMenu(session.rank)),
-        });
-        return;
-      }
-      let txt = "📊 *Son Aktiviteler:*\n\n";
-      for (const e of last20) {
-        const t = e.time.slice(11, 19);
-        txt += `\`${t}\` @${e.username} — *${e.action}*${e.detail ? `\n   ${e.detail}` : ""}\n`;
-      }
-      await editMessage(chatId, msgId, txt, {
-        parse_mode: "Markdown",
-        reply_markup: JSON.stringify(mainMenu(session.rank)),
-      });
+      let txt = last20.length ? "📊 *Son Aktiviteler:*\n\n" : "📊 Henüz aktivite yok.";
+      for (const e of last20) txt += `\`${e.time.slice(11,19)}\` @${e.username} — *${e.action}*${e.detail ? `\n   ${e.detail}` : ""}\n`;
+      await editMsg(chatId, msgId, txt, { parse_mode: "Markdown", reply_markup: JSON.stringify(mainMenu(session.rank)) });
       return;
     }
 
-    // ── VIEW SECURITY LOGS ──
+    // SECURITY LOG
     if (data === "view_security") {
       const last20 = securityAlerts.slice(-20).reverse();
-      if (last20.length === 0) {
-        await editMessage(chatId, msgId, "🚨 Güvenlik kaydı yok.", {
-          reply_markup: JSON.stringify(mainMenu(session.rank)),
-        });
-        return;
-      }
-      let txt = "🚨 *Güvenlik Logları:*\n\n";
-      for (const e of last20) {
-        const t = e.time.slice(11, 19);
-        txt += `\`${t}\` [${e.type}] @${e.username} (${e.chatId})\n   ${e.detail}\n\n`;
-      }
-      await editMessage(chatId, msgId, txt, {
-        parse_mode: "Markdown",
-        reply_markup: JSON.stringify(mainMenu(session.rank)),
-      });
+      let txt = last20.length ? "🚨 *Güvenlik:*\n\n" : "🚨 Kayıt yok.";
+      for (const e of last20) txt += `\`${e.time.slice(11,19)}\` [${e.type}] @${e.username}\n   ${e.detail}\n\n`;
+      await editMsg(chatId, msgId, txt, { parse_mode: "Markdown", reply_markup: JSON.stringify(mainMenu(session.rank)) });
       return;
     }
 
-    // ── VIEW SESSIONS ──
+    // SESSIONS
     if (data === "view_sessions") {
       const active = Object.entries(sessions).filter(([, s]) => s.authed && !isSessionExpired(s));
-      if (active.length === 0) {
-        await editMessage(chatId, msgId, "👥 Aktif oturum yok.", {
-          reply_markup: JSON.stringify(mainMenu(session.rank)),
-        });
-        return;
-      }
-      let txt = "👥 *Aktif Oturumlar:*\n\n";
+      let txt = active.length ? "👥 *Aktif Oturumlar:*\n\n" : "👥 Aktif oturum yok.";
       for (const [id, s] of active) {
         const ago = Math.floor((Date.now() - s.lastActivity) / 60000);
-        txt += `🔹 \`${id}\` — Rank: *${s.rank}* — ${ago}dk önce aktif\n`;
+        const u = users[id];
+        txt += `🔹 \`${id}\` @${u ? u.username : "?"} — *${s.rank}* — ${ago}dk\n`;
       }
-      await editMessage(chatId, msgId, txt, {
-        parse_mode: "Markdown",
-        reply_markup: JSON.stringify(mainMenu(session.rank)),
-      });
+      await editMsg(chatId, msgId, txt, { parse_mode: "Markdown", reply_markup: JSON.stringify(mainMenu(session.rank)) });
       return;
     }
 
@@ -446,303 +387,340 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
     const msg = body.message;
     const chatId = msg.chat.id;
     const text = msg.text.trim();
-    const username = msg.from.username || msg.from.first_name || "?";
+    const tgUser = msg.from.username || msg.from.first_name || "?";
     const session = getSession(chatId);
 
-    // ── BANNED CHECK ──
+    // Auto-seed owner
+    if (String(chatId) === String(ADMIN_ID)) seedOwner(chatId, tgUser);
+
+    // BANNED
     if (bannedUsers[chatId]) {
-      logSecurity(chatId, username, "BANNED_ACCESS", `Tried: ${text.slice(0, 30)}`);
-      await send(chatId, `🚫 Hesabınız banlanmış.\nSebep: ${bannedUsers[chatId].reason || "Belirtilmedi"}`);
+      logSecurity(chatId, tgUser, "BANNED_ACCESS", text.slice(0, 30));
+      await send(chatId, `🚫 Banlandınız.\nSebep: ${bannedUsers[chatId].reason || "—"}`);
       return;
     }
 
-    // ── /start ──
+    // /start
     if (text === "/start") {
-      logActivity(chatId, username, "BOT_START");
+      logActivity(chatId, tgUser, "START");
+      const isOwner = String(chatId) === String(ADMIN_ID);
       await send(chatId,
-        `╔══════════════════════════╗\n` +
-        `║     🌐 NEXUS HUB 🌐     ║\n` +
-        `╠══════════════════════════╣\n` +
-        `║  Key Yönetim Sistemi     ║\n` +
-        `║  v2.0 — Güvenli Giriş   ║\n` +
-        `╚══════════════════════════╝\n\n` +
-        `🔐 Giriş yapmak için:\n/login <şifre>\n\n` +
-        `⚠️ ${MAX_LOGIN_ATTEMPTS} başarısız deneme = ${LOCKOUT_MINUTES}dk kilit`
-      );
-      return;
-    }
-
-    // ── /login <password> ──
-    if (text.startsWith("/login")) {
-      const parts = text.split(" ");
-      const pw = parts[1] || "";
-
-      // lockout check
-      if (isLocked(session)) {
-        const remaining = Math.ceil((session.lockedUntil - Date.now()) / 60000);
-        logSecurity(chatId, username, "LOCKED_LOGIN_ATTEMPT", `${remaining}dk kalan`);
-        await send(chatId, `🔒 Hesap kilitli. ${remaining} dakika bekleyin.`);
-        return;
-      }
-
-      if (!pw) {
-        await send(chatId, "⚠️ Kullanım: /login <şifre>");
-        return;
-      }
-
-      if (pw !== ADMIN_PASSWORD) {
-        session.loginAttempts++;
-        const remaining = MAX_LOGIN_ATTEMPTS - session.loginAttempts;
-        logSecurity(chatId, username, "FAILED_LOGIN", `Deneme ${session.loginAttempts}/${MAX_LOGIN_ATTEMPTS} — şifre: ${pw.slice(0, 2)}***`);
-
-        if (session.loginAttempts >= MAX_LOGIN_ATTEMPTS) {
-          session.lockedUntil = Date.now() + LOCKOUT_MINUTES * 60 * 1000;
-          logSecurity(chatId, username, "BRUTE_FORCE", `${MAX_LOGIN_ATTEMPTS} başarısız deneme — ${LOCKOUT_MINUTES}dk kilitlendi`);
-          await send(chatId, `🚨 Çok fazla başarısız deneme!\nHesap ${LOCKOUT_MINUTES} dakika kilitlendi.`);
-          return;
-        }
-
-        await send(chatId, `❌ Yanlış şifre. Kalan hak: ${remaining}`);
-        return;
-      }
-
-      // success
-      session.authed = true;
-      session.rank = String(chatId) === String(ADMIN_ID) ? "OWNER" : "USER";
-      session.loginAttempts = 0;
-      session.lockedUntil = 0;
-      touchSession(session);
-      logActivity(chatId, username, "LOGIN_SUCCESS", `Rank: ${session.rank}`);
-      logSecurity(chatId, username, "LOGIN_OK", `IP oturumu başlatıldı — Rank: ${session.rank}`);
-
-      await send(chatId,
-        `✅ *Giriş Başarılı!*\n\n` +
-        `👤 Kullanıcı: @${username}\n` +
-        `🎖 Rank: *${session.rank}*\n` +
-        `⏱ Oturum: ${SESSION_TIMEOUT_MINUTES}dk\n\n` +
-        `Menüyü açmak için: /menu`,
+        `╔══════════════════════════════╗\n` +
+        `║       🌐 NEXUS HUB 🌐       ║\n` +
+        `╠══════════════════════════════╣\n` +
+        `║  Key Yönetim Sistemi v2.1    ║\n` +
+        `║  Kullanıcı Bazlı Giriş      ║\n` +
+        `╚══════════════════════════════╝\n\n` +
+        (isOwner
+          ? `👑 *OWNER tespit edildi!*\nOtomatik giriş: /login\n\n`
+          : `🔐 Giriş: /login <kullanıcıadı> <şifre>\n\n`) +
+        `⚠️ ${MAX_LOGIN_ATTEMPTS} yanlış = ${LOCKOUT_MINUTES}dk kilit`,
         { parse_mode: "Markdown" }
       );
       return;
     }
 
-    // ── AUTH GATE ──
-    if (!session.authed || isSessionExpired(session)) {
-      if (text.startsWith("/")) {
-        logSecurity(chatId, username, "UNAUTH_COMMAND", text.slice(0, 50));
+    // /login
+    if (text.startsWith("/login")) {
+      const parts = text.split(/\s+/);
+
+      if (isLocked(session)) {
+        const rem = Math.ceil((session.lockedUntil - Date.now()) / 60000);
+        logSecurity(chatId, tgUser, "LOCKED_ATTEMPT", `${rem}dk`);
+        await send(chatId, `🔒 Kilitli. ${rem}dk bekleyin.`);
+        return;
       }
-      await send(chatId, "🔐 Önce giriş yapın: /login <şifre>");
+
+      // OWNER — no password needed, just /login
+      if (String(chatId) === String(ADMIN_ID)) {
+        session.authed = true;
+        session.rank = "OWNER";
+        session.loginAttempts = 0;
+        session.lockedUntil = 0;
+        touchSession(session);
+        logActivity(chatId, tgUser, "LOGIN_OWNER");
+        await send(chatId,
+          `✅ *OWNER Giriş Başarılı!*\n\n👑 @${tgUser}\n⏱ Oturum: ${SESSION_TIMEOUT_MINUTES}dk\n\n/menu ile devam et.`,
+          { parse_mode: "Markdown" });
+        return;
+      }
+
+      // Normal users: /login <username> <password>
+      const uname = parts[1] || "";
+      const pw = parts[2] || "";
+
+      if (!uname || !pw) {
+        await send(chatId, "⚠️ Kullanım: /login <kullanıcıadı> <şifre>");
+        return;
+      }
+
+      // find user by chatId or by username
+      let foundId = null;
+      let foundUser = null;
+      for (const [id, u] of Object.entries(users)) {
+        if (u.username.toLowerCase() === uname.toLowerCase()) {
+          foundId = id; foundUser = u; break;
+        }
+      }
+
+      if (!foundUser || foundUser.password !== pw) {
+        session.loginAttempts++;
+        const rem = MAX_LOGIN_ATTEMPTS - session.loginAttempts;
+        logSecurity(chatId, tgUser, "FAILED_LOGIN", `user: ${uname} | ${session.loginAttempts}/${MAX_LOGIN_ATTEMPTS}`);
+        if (session.loginAttempts >= MAX_LOGIN_ATTEMPTS) {
+          session.lockedUntil = Date.now() + LOCKOUT_MINUTES * 60000;
+          logSecurity(chatId, tgUser, "BRUTE_FORCE", `${MAX_LOGIN_ATTEMPTS} deneme — kilitlendi`);
+          await send(chatId, `🚨 ${LOCKOUT_MINUTES}dk kilitlendi!`);
+          return;
+        }
+        await send(chatId, `❌ Yanlış kullanıcı adı veya şifre. Kalan: ${rem}`);
+        return;
+      }
+
+      // Check if chatId matches (user must login from their own account)
+      // OR allow login from any chat but bind to the registered chatId
+      session.authed = true;
+      session.rank = foundUser.rank;
+      session.loginAttempts = 0;
+      session.lockedUntil = 0;
+      touchSession(session);
+      logActivity(chatId, tgUser, "LOGIN_OK", `as ${uname} | rank: ${foundUser.rank}`);
+      logSecurity(chatId, tgUser, "LOGIN_OK", `${uname} — ${foundUser.rank}`);
+      await send(chatId,
+        `✅ *Giriş Başarılı!*\n\n👤 ${uname}\n🎖 *${foundUser.rank}*\n⏱ ${SESSION_TIMEOUT_MINUTES}dk\n\n/menu`,
+        { parse_mode: "Markdown" });
+      return;
+    }
+
+    // AUTH GATE
+    if (!session.authed || isSessionExpired(session)) {
+      if (text.startsWith("/")) logSecurity(chatId, tgUser, "UNAUTH_CMD", text.slice(0, 40));
+      await send(chatId, "🔐 Giriş yapın: /login <kullanıcıadı> <şifre>");
       return;
     }
     touchSession(session);
 
-    // ── /menu ──
+    // /menu
     if (text === "/menu") {
-      logActivity(chatId, username, "MENU_OPEN");
-      await send(chatId, `🌐 *NEXUS HUB — Ana Menü*\n\n👤 @${username} | 🎖 ${session.rank}`, {
-        parse_mode: "Markdown",
-        reply_markup: JSON.stringify(mainMenu(session.rank)),
+      const u = users[chatId];
+      logActivity(chatId, tgUser, "MENU");
+      await send(chatId, `🌐 *NEXUS HUB*\n\n👤 @${tgUser} | 🎖 ${session.rank}`, {
+        parse_mode: "Markdown", reply_markup: JSON.stringify(mainMenu(session.rank)),
       });
       return;
     }
 
-    // ── /status ──
+    // /status
     if (text === "/status") {
-      const activeKeys = Object.values(keys).filter(v => v.status === "ok").length;
-      const activeSessions = Object.values(sessions).filter(s => s.authed && !isSessionExpired(s)).length;
+      const ak = Object.values(keys).filter(v => v.status === "ok").length;
+      const as2 = Object.values(sessions).filter(s => s.authed && !isSessionExpired(s)).length;
+      const uc = Object.keys(users).length;
       await send(chatId,
-        `📊 *Sistem Durumu*\n\n` +
-        `🔑 Aktif Key: ${activeKeys}\n` +
-        `👥 Aktif Oturum: ${activeSessions}\n` +
-        `🔧 Bakım: ${maintenance ? "AKTİF" : "Kapalı"}\n` +
-        `📢 Duyuru: ${announcement || "Yok"}\n` +
-        `🚨 Güvenlik Alarmı: ${securityAlerts.filter(s => Date.now() - new Date(s.time).getTime() < 3600000).length} (son 1 saat)`,
-        { parse_mode: "Markdown" }
-      );
+        `📊 *Durum*\n\n🔑 Key: ${ak}\n👥 Oturum: ${as2}\n👤 Kullanıcı: ${uc}\n🔧 Bakım: ${maintenance ? "AKTİF" : "Kapalı"}\n📢 Duyuru: ${announcement || "—"}`,
+        { parse_mode: "Markdown" });
       return;
     }
 
-    // ── /myid ──
+    // /myid
     if (text === "/myid") {
-      await send(chatId, `🆔 Chat ID: \`${chatId}\``, { parse_mode: "Markdown" });
+      await send(chatId, `🆔 \`${chatId}\``, { parse_mode: "Markdown" });
       return;
     }
 
-    // ── PENDING ACTIONS (text input flows) ──
-    const pa = pendingAction[chatId];
+    // ── PENDING TEXT INPUT FLOWS ──
+    const pa = pending[chatId];
     if (pa) {
-      // delete key
+      // ADD USER
+      if (pa.step === "add_user") {
+        delete pending[chatId];
+        const parts = text.split(/\s+/);
+        if (parts.length < 3) {
+          await send(chatId, "❌ Format: <chatID> <kullanıcıadı> <şifre>");
+          return;
+        }
+        const [targetId, newUser, newPw] = parts;
+        if (users[targetId]) {
+          await send(chatId, `❌ Bu Chat ID zaten kayıtlı: @${users[targetId].username}`);
+          return;
+        }
+        // check duplicate username
+        for (const u of Object.values(users)) {
+          if (u.username.toLowerCase() === newUser.toLowerCase()) {
+            await send(chatId, `❌ Bu kullanıcı adı zaten var: ${newUser}`);
+            return;
+          }
+        }
+        users[targetId] = {
+          username: newUser,
+          password: newPw,
+          rank: "USER",
+          createdAt: new Date().toISOString(),
+          createdBy: tgUser,
+        };
+        logActivity(chatId, tgUser, "USER_ADDED", `${targetId} — ${newUser}`);
+        await send(chatId, `✅ Kullanıcı eklendi!\n\n🆔 Chat ID: \`${targetId}\`\n👤 Ad: ${newUser}\n🔑 Şifre: ${newPw}\n🎖 Rank: USER`, { parse_mode: "Markdown" });
+        await send(chatId, "/menu");
+        return;
+      }
+
+      // DELETE USER
+      if (pa.step === "del_user") {
+        delete pending[chatId];
+        const tid = text.trim();
+        if (tid === String(ADMIN_ID)) {
+          await send(chatId, "❌ Owner silinemez.");
+          return;
+        }
+        if (!users[tid]) {
+          await send(chatId, "❌ Kullanıcı bulunamadı.");
+          return;
+        }
+        const deleted = users[tid].username;
+        delete users[tid];
+        if (sessions[tid]) { sessions[tid].authed = false; sessions[tid].rank = null; }
+        logActivity(chatId, tgUser, "USER_DELETED", `${tid} — ${deleted}`);
+        await send(chatId, `✅ Silindi: ${deleted} (\`${tid}\`)`, { parse_mode: "Markdown" });
+        await send(chatId, "/menu");
+        return;
+      }
+
+      // CHANGE RANK
+      if (pa.step === "change_rank") {
+        delete pending[chatId];
+        const parts = text.split(/\s+/);
+        if (parts.length < 2) {
+          await send(chatId, "❌ Format: <chatID> <rank>\nRanklar: USER, MOD, ADMIN, OWNER");
+          return;
+        }
+        const [tid, newRank] = [parts[0], parts[1].toUpperCase()];
+        if (!RANKS[newRank]) {
+          await send(chatId, "❌ Geçersiz rank. USER / MOD / ADMIN / OWNER");
+          return;
+        }
+        if (!users[tid]) {
+          await send(chatId, "❌ Kullanıcı bulunamadı.");
+          return;
+        }
+        const oldRank = users[tid].rank;
+        users[tid].rank = newRank;
+        if (sessions[tid] && sessions[tid].authed) sessions[tid].rank = newRank;
+        logActivity(chatId, tgUser, "RANK_CHANGED", `${tid} @${users[tid].username}: ${oldRank} → ${newRank}`);
+        await send(chatId, `✅ @${users[tid].username} rankı: *${oldRank}* → *${newRank}*`, { parse_mode: "Markdown" });
+        await send(chatId, "/menu");
+        return;
+      }
+
+      // DELETE KEY
       if (pa.step === "delete_key") {
-        const keyToDelete = text.trim().toUpperCase();
-        delete pendingAction[chatId];
-        if (keys[keyToDelete]) {
-          delete keys[keyToDelete];
-          logActivity(chatId, username, "KEY_DELETED", keyToDelete);
-          await send(chatId, `✅ Key silindi: \`${keyToDelete}\``, { parse_mode: "Markdown" });
+        delete pending[chatId];
+        const k = text.trim().toUpperCase();
+        if (keys[k]) {
+          delete keys[k];
+          logActivity(chatId, tgUser, "KEY_DELETED", k);
+          await send(chatId, `✅ Silindi: \`${k}\``, { parse_mode: "Markdown" });
         } else {
           await send(chatId, "❌ Key bulunamadı.");
         }
-        await send(chatId, "📋 Menü: /menu");
+        await send(chatId, "/menu");
         return;
       }
 
-      // announce
+      // ANNOUNCE
       if (pa.step === "announce") {
-        delete pendingAction[chatId];
+        delete pending[chatId];
         if (text.toLowerCase() === "sil") {
           announcement = "";
-          logActivity(chatId, username, "ANNOUNCE_CLEAR");
+          logActivity(chatId, tgUser, "ANNOUNCE_CLEAR");
           await send(chatId, "📢 Duyuru silindi.");
         } else {
           announcement = text;
-          logActivity(chatId, username, "ANNOUNCE_SET", text.slice(0, 80));
-          await send(chatId, `📢 Duyuru ayarlandı:\n${text}`);
+          logActivity(chatId, tgUser, "ANNOUNCE_SET", text.slice(0, 80));
+          await send(chatId, `📢 Duyuru: ${text}`);
         }
-        await send(chatId, "📋 Menü: /menu");
+        await send(chatId, "/menu");
         return;
       }
 
-      // ban
+      // BAN
       if (pa.step === "ban_id") {
-        pendingAction[chatId] = { step: "ban_reason", targetId: text.trim() };
-        await send(chatId, "📝 Ban sebebini yazın:");
+        pending[chatId] = { step: "ban_reason", targetId: text.trim() };
+        await send(chatId, "📝 Sebep:");
         return;
       }
       if (pa.step === "ban_reason") {
-        const targetId = pa.targetId;
-        const reason = text;
-        delete pendingAction[chatId];
-        bannedUsers[targetId] = { reason, bannedAt: new Date().toISOString(), bannedBy: username };
-        // kill their session
-        if (sessions[targetId]) {
-          sessions[targetId].authed = false;
-          sessions[targetId].rank = null;
-        }
-        logActivity(chatId, username, "USER_BANNED", `${targetId} — ${reason}`);
-        logSecurity(chatId, username, "BAN_ISSUED", `Target: ${targetId} — ${reason}`);
-        await send(chatId, `🚫 Kullanıcı banlandı: \`${targetId}\`\nSebep: ${reason}`, { parse_mode: "Markdown" });
-        await send(chatId, "📋 Menü: /menu");
+        const tid = pa.targetId;
+        delete pending[chatId];
+        bannedUsers[tid] = { reason: text, bannedAt: new Date().toISOString(), bannedBy: tgUser };
+        if (sessions[tid]) { sessions[tid].authed = false; sessions[tid].rank = null; }
+        logActivity(chatId, tgUser, "BAN", `${tid} — ${text}`);
+        await send(chatId, `🚫 Banlandı: \`${tid}\``, { parse_mode: "Markdown" });
+        await send(chatId, "/menu");
         return;
       }
 
-      // unban
+      // UNBAN
       if (pa.step === "unban_id") {
-        const targetId = text.trim();
-        delete pendingAction[chatId];
-        if (bannedUsers[targetId]) {
-          delete bannedUsers[targetId];
-          logActivity(chatId, username, "USER_UNBANNED", targetId);
-          await send(chatId, `✅ Unban yapıldı: \`${targetId}\``, { parse_mode: "Markdown" });
+        delete pending[chatId];
+        const tid = text.trim();
+        if (bannedUsers[tid]) {
+          delete bannedUsers[tid];
+          logActivity(chatId, tgUser, "UNBAN", tid);
+          await send(chatId, `✅ Unban: \`${tid}\``, { parse_mode: "Markdown" });
         } else {
-          await send(chatId, "❌ Bu kullanıcı banlı değil.");
+          await send(chatId, "❌ Banlı değil.");
         }
-        await send(chatId, "📋 Menü: /menu");
+        await send(chatId, "/menu");
         return;
       }
     }
 
-    // ── UNKNOWN COMMAND ──
+    // HELP
     if (text.startsWith("/")) {
       await send(chatId,
-        "📌 *Komutlar:*\n" +
-        "/start — Hoşgeldin\n" +
-        "/login <şifre> — Giriş\n" +
-        "/menu — Ana menü\n" +
-        "/status — Sistem durumu\n" +
-        "/myid — Chat ID",
-        { parse_mode: "Markdown" }
-      );
+        "📌 *Komutlar:*\n/start — Hoşgeldin\n/login — Giriş\n/menu — Menü\n/status — Durum\n/myid — Chat ID",
+        { parse_mode: "Markdown" });
       return;
     }
   }
 });
 
-// ─── API ENDPOINTS ──────────────────────────────────────────
-
-// Health + status for scripts
+// ─── API ────────────────────────────────────────────────────
 app.get("/ping", (req, res) => {
-  res.json({
-    status: "ok",
-    maintenance,
-    announcement,
-    uptime: process.uptime(),
-    activeKeys: Object.values(keys).filter(v => v.status === "ok").length,
-  });
+  res.json({ status: "ok", maintenance, announcement, uptime: process.uptime(), keys: Object.values(keys).filter(v => v.status === "ok").length, users: Object.keys(users).length });
 });
 
-// Key validation for Lua scripts
 app.get("/check", (req, res) => {
   const key = (req.query.key || "").trim().toUpperCase();
   const ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress || "?";
-
-  if (!key) return res.json({ status: "error", message: "key parametresi eksik" });
-
+  if (!key) return res.json({ status: "error", message: "key yok" });
   const entry = keys[key];
   if (!entry) {
-    logSecurity("API", ip, "INVALID_KEY_CHECK", `Key: ${key.slice(0, 12)}...`);
-    return res.json({ status: "invalid", message: "key bulunamadı" });
+    logSecurity("API", ip, "INVALID_KEY", key.slice(0, 12));
+    return res.json({ status: "invalid" });
   }
-
-  // expiry check
   if (entry.expire && Date.now() > entry.expire) {
     entry.status = "expired";
-    logActivity("API", ip, "EXPIRED_KEY_CHECK", key);
-    return res.json({ status: "expired", message: "key süresi dolmuş" });
+    return res.json({ status: "expired" });
   }
-
-  logActivity("API", ip, "KEY_VERIFIED", `${key} | ${entry.rank} | ${entry.game}`);
-  res.json({
-    status: "ok",
-    rank: entry.rank,
-    game: entry.game,
-    expire: entry.expire || null,
-  });
-});
-
-// Security log endpoint (requires admin password header)
-app.get("/admin/logs", (req, res) => {
-  const auth = req.headers["x-admin-key"] || req.query.pw;
-  if (auth !== ADMIN_PASSWORD) {
-    return res.status(403).json({ error: "yetkisiz" });
-  }
-  res.json({
-    activity: activityLog.slice(-50),
-    security: securityAlerts.slice(-50),
-    sessions: Object.entries(sessions).map(([id, s]) => ({
-      chatId: id,
-      authed: s.authed,
-      rank: s.rank,
-      lastActivity: s.lastActivity ? new Date(s.lastActivity).toISOString() : null,
-      locked: isLocked(s),
-    })),
-    banned: bannedUsers,
-  });
+  logActivity("API", ip, "KEY_OK", `${key} | ${entry.rank} | ${entry.game}`);
+  res.json({ status: "ok", rank: entry.rank, game: entry.game, expire: entry.expire || null });
 });
 
 // ─── WEBHOOK SETUP ──────────────────────────────────────────
 async function setupWebhook() {
   const url = `https://nexus-hub-b3gl.onrender.com/webhook/${BOT_TOKEN}`;
   try {
-    const r = await fetch(`${API}/setWebhook`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url }),
-    });
-    const data = await r.json();
-    console.log("Webhook:", data.ok ? "SET" : data.description);
-  } catch (e) { console.error("Webhook error:", e.message); }
+    const r = await fetch(`${API}/setWebhook`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ url }) });
+    const d = await r.json();
+    console.log("Webhook:", d.ok ? "SET" : d.description);
+  } catch (e) { console.error("Webhook:", e.message); }
 }
 
-// ─── EXPIRED KEY CLEANUP (every 10 min) ─────────────────────
+// CLEANUP
 setInterval(() => {
   const now = Date.now();
-  for (const [k, v] of Object.entries(keys)) {
-    if (v.expire && now > v.expire) v.status = "expired";
-  }
+  for (const [, v] of Object.entries(keys)) if (v.expire && now > v.expire) v.status = "expired";
 }, 600000);
 
-// ─── START ──────────────────────────────────────────────────
-app.listen(PORT, () => {
-  console.log(`NEXUS HUB running on :${PORT}`);
-  setupWebhook();
-});
+// START
+app.listen(PORT, () => { console.log(`NEXUS H
