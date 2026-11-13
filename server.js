@@ -1,13 +1,73 @@
 // ═══════════════════════════════════════════════════════════════
-//  NEXUS HUB v2.1 — Telegram Bot + Key API Server
+//  NEXUS HUB v2.2 — Telegram Bot + Key API Server
 //  Built by Olivia — https://discord.gg/ojailbreaks
-//  Kullanıcı bazlı giriş sistemi
+//  Kullanıcı bazlı giriş + tam güvenlik zırhı
 // ═══════════════════════════════════════════════════════════════
 
 const express = require("express");
 const crypto = require("crypto");
 const app = express();
-app.use(express.json());
+
+// ─── SECURITY MIDDLEWARE ────────────────────────────────────
+// Body size limit — block oversized payloads
+app.use(express.json({ limit: "1mb" }));
+
+// Security headers on every response
+app.use((req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("X-XSS-Protection", "1; mode=block");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("Cache-Control", "no-store");
+  next();
+});
+
+// ─── RATE LIMITER ───────────────────────────────────────────
+const rateLimits = {};   // ip -> { count, resetAt }
+const RATE_WINDOW = 60000; // 1 minute
+const RATE_MAX_API = 30;   // max 30 API calls per minute per IP
+const RATE_MAX_WEBHOOK = 60; // webhook is higher
+
+function rateCheck(ip, max) {
+  const now = Date.now();
+  if (!rateLimits[ip] || now > rateLimits[ip].resetAt) {
+    rateLimits[ip] = { count: 1, resetAt: now + RATE_WINDOW };
+    return true;
+  }
+  rateLimits[ip].count++;
+  return rateLimits[ip].count <= max;
+}
+
+// Clean rate limits every 5 min
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, v] of Object.entries(rateLimits)) {
+    if (now > v.resetAt) delete rateLimits[ip];
+  }
+}, 300000);
+
+// ─── ANTI-FLOOD PER CHAT ───────────────────────────────────
+const chatFlood = {};    // chatId -> { count, resetAt }
+const FLOOD_WINDOW = 10000; // 10 seconds
+const FLOOD_MAX = 8;       // max 8 messages per 10 sec
+
+function floodCheck(chatId) {
+  const now = Date.now();
+  const id = String(chatId);
+  if (!chatFlood[id] || now > chatFlood[id].resetAt) {
+    chatFlood[id] = { count: 1, resetAt: now + FLOOD_WINDOW };
+    return true;
+  }
+  chatFlood[id].count++;
+  return chatFlood[id].count <= FLOOD_MAX;
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, v] of Object.entries(chatFlood)) {
+    if (now > v.resetAt) delete chatFlood[id];
+  }
+}, 60000);
 
 // ─── ENV ────────────────────────────────────────────────────
 const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -87,8 +147,20 @@ function logSecurity(chatId, username, type, detail = "") {
   const entry = { time: new Date().toISOString(), chatId: String(chatId), username: username || "?", type, detail };
   securityAlerts.push(entry);
   if (securityAlerts.length > 200) securityAlerts.shift();
-  if (type === "BRUTE_FORCE" || type === "BANNED_ACCESS") {
-    send(ADMIN_ID, `🚨 *GÜVENLİK ALARMI*\n\nTip: \`${type}\`\nKullanıcı: @${username || "?"} (${chatId})\nDetay: ${detail}`, { parse_mode: "Markdown" });
+  // Notify owner on critical events
+  const critical = ["BRUTE_FORCE", "BANNED_ACCESS", "FLOOD", "RATE_LIMIT", "INVALID_PAYLOAD", "MALFORMED_KEY"];
+  if (critical.includes(type)) {
+    send(ADMIN_ID, `🚨 *GÜVENLİK ALARMI*\n\nTip: \`${type}\`\nKim: @${username || "?"} (\`${chatId}\`)\nDetay: ${detail}\nZaman: ${entry.time}`, { parse_mode: "Markdown" });
+  }
+
+  // Auto-ban after 3 brute force lockouts
+  if (type === "BRUTE_FORCE") {
+    const bfCount = securityAlerts.filter(a => a.chatId === String(chatId) && a.type === "BRUTE_FORCE").length;
+    if (bfCount >= 3 && !bannedUsers[chatId]) {
+      bannedUsers[chatId] = { reason: "Otomatik ban: 3x brute force", bannedAt: new Date().toISOString(), bannedBy: "SYSTEM" };
+      if (sessions[chatId]) { sessions[chatId].authed = false; sessions[chatId].rank = null; }
+      send(ADMIN_ID, `🤖 *OTOMATİK BAN*\n\n\`${chatId}\` @${username}\n3 kez brute force — otomatik banlandı`, { parse_mode: "Markdown" });
+    }
   }
 }
 
@@ -137,61 +209,88 @@ async function answerCb(cbId, text = "") {
 // ─── KEYBOARDS ──────────────────────────────────────────────
 function mainMenu(rank) {
   const rows = [
-    [{ text: "🔑 Key Oluştur", callback_data: "key_create" }],
-    [{ text: "📋 Aktif Keyler", callback_data: "key_list" }],
-    [{ text: "❌ Key Sil", callback_data: "key_delete_prompt" }],
+    [{ text: "🟢 🔑 Key Oluştur", callback_data: "key_create" }],
+    [{ text: "🔵 📋 Aktif Keyler", callback_data: "key_list" }],
+    [{ text: "🔴 ❌ Key Sil", callback_data: "key_delete_prompt" }],
   ];
   if (rankLevel(rank) >= RANKS.ADMIN) {
-    rows.push([{ text: "📊 Aktivite Logu", callback_data: "view_activity" }]);
-    rows.push([{ text: "🚨 Güvenlik Logları", callback_data: "view_security" }]);
-    rows.push([{ text: "👥 Aktif Oturumlar", callback_data: "view_sessions" }]);
-    rows.push([{ text: "👤 Kullanıcılar", callback_data: "view_users" }]);
+    rows.push([{ text: "🟡 📊 Aktivite Logu", callback_data: "view_activity" }]);
+    rows.push([{ text: "🟠 🚨 Güvenlik Logları", callback_data: "view_security" }]);
+    rows.push([{ text: "🟣 👥 Aktif Oturumlar", callback_data: "view_sessions" }]);
+    rows.push([{ text: "⚪ 👤 Kullanıcılar", callback_data: "view_users" }]);
   }
   if (rankLevel(rank) >= RANKS.OWNER) {
-    rows.push([{ text: "➕ Kullanıcı Ekle", callback_data: "add_user_prompt" }]);
-    rows.push([{ text: "🗑 Kullanıcı Sil", callback_data: "del_user_prompt" }]);
-    rows.push([{ text: "🎖 Rank Değiştir", callback_data: "change_rank_prompt" }]);
+    rows.push([{ text: "🟢 ➕ Kullanıcı Ekle", callback_data: "add_user_prompt" }]);
+    rows.push([{ text: "🔴 🗑 Kullanıcı Sil", callback_data: "del_user_prompt" }]);
+    rows.push([{ text: "🟡 🎖 Rank Değiştir", callback_data: "change_rank_prompt" }]);
     rows.push([
-      { text: "🔧 Bakım Modu", callback_data: "toggle_maintenance" },
-      { text: "📢 Duyuru", callback_data: "set_announce" },
+      { text: "🟠 🔧 Bakım", callback_data: "toggle_maintenance" },
+      { text: "🔵 📢 Duyuru", callback_data: "set_announce" },
     ]);
     rows.push([
-      { text: "🚫 Ban", callback_data: "ban_prompt" },
-      { text: "✅ Unban", callback_data: "unban_prompt" },
+      { text: "🔴 🚫 Ban", callback_data: "ban_prompt" },
+      { text: "🟢 ✅ Unban", callback_data: "unban_prompt" },
     ]);
   }
-  rows.push([{ text: "🔒 Çıkış Yap", callback_data: "logout" }]);
+  rows.push([{ text: "⚫ 🔒 Çıkış Yap", callback_data: "logout" }]);
   return { inline_keyboard: rows };
 }
 
 function durationKb() {
   return { inline_keyboard: [
-    [{ text: "⏱ Günlük", callback_data: "dur_DAY" }, { text: "📅 Haftalık", callback_data: "dur_WEEK" }],
-    [{ text: "🗓 Aylık", callback_data: "dur_MONTH" }, { text: "♾ Süresiz", callback_data: "dur_PERM" }],
+    [{ text: "🟢 ⏱ Günlük", callback_data: "dur_DAY" }, { text: "🔵 📅 Haftalık", callback_data: "dur_WEEK" }],
+    [{ text: "🟣 🗓 Aylık", callback_data: "dur_MONTH" }, { text: "🟡 ♾ Süresiz", callback_data: "dur_PERM" }],
   ]};
 }
 
 function rankKb() {
   return { inline_keyboard: [
-    [{ text: "👤 USER", callback_data: "rank_USER" }, { text: "🛡 MOD", callback_data: "rank_MOD" }],
-    [{ text: "⚡ ADMIN", callback_data: "rank_ADMIN" }, { text: "👑 OWNER", callback_data: "rank_OWNER" }],
+    [{ text: "🟢 👤 USER", callback_data: "rank_USER" }, { text: "🔵 🛡 MOD", callback_data: "rank_MOD" }],
+    [{ text: "🟠 ⚡ ADMIN", callback_data: "rank_ADMIN" }, { text: "🔴 👑 OWNER", callback_data: "rank_OWNER" }],
   ]};
 }
 
 function gameKb() {
   return { inline_keyboard: [
-    [{ text: "🌍 Tüm Oyunlar", callback_data: "game_all" }],
-    [{ text: "🌾 Kukirin", callback_data: "game_kukirin" }],
-    [{ text: "🔧 Build & Weld", callback_data: "game_buildweld" }],
-    [{ text: "🏙️ San Diego RP", callback_data: "game_sdrp" }],
+    [{ text: "🟡 🌍 Tüm Oyunlar", callback_data: "game_all" }],
+    [{ text: "🟢 🌾 Kukirin", callback_data: "game_kukirin" }],
+    [{ text: "🔵 🔧 Build & Weld", callback_data: "game_buildweld" }],
+    [{ text: "🟣 🏙️ San Diego RP", callback_data: "game_sdrp" }],
   ]};
 }
 
 // ─── PENDING STATE ──────────────────────────────────────────
 let pending = {};
 
+// ─── WEBHOOK SECRET VERIFY ──────────────────────────────────
+// Telegram sends to /webhook/<token> — if someone hits a random
+// path, they get 404. The token in the URL is the secret.
+// Additional: verify the update has required Telegram fields.
+function isValidTelegramUpdate(body) {
+  if (!body) return false;
+  if (body.message) return body.message.chat && body.message.chat.id;
+  if (body.callback_query) return body.callback_query.message && body.callback_query.from;
+  return false;
+}
+
 // ─── WEBHOOK ────────────────────────────────────────────────
 app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
+  const ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress || "?";
+
+  // Rate limit webhook
+  if (!rateCheck(ip, RATE_MAX_WEBHOOK)) {
+    logSecurity("WEBHOOK", ip, "RATE_LIMIT", "webhook flood");
+    res.sendStatus(429);
+    return;
+  }
+
+  // Validate Telegram update structure
+  if (!isValidTelegramUpdate(req.body)) {
+    logSecurity("WEBHOOK", ip, "INVALID_PAYLOAD", "malformed update");
+    res.sendStatus(400);
+    return;
+  }
+
   res.sendStatus(200);
   const body = req.body;
 
@@ -206,9 +305,40 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
 
     await answerCb(cb.id);
 
+    // ── SELF REGISTER (button) ──
+    if (data === "self_register") {
+      if (users[chatId]) {
+        await send(chatId, `Zaten kayıtlısın: *${users[chatId].username}*`, { parse_mode: "Markdown" });
+        return;
+      }
+      pending[chatId] = { step: "self_reg_user" };
+      await editMsg(chatId, msgId, "📝 *Kayıt*\n\nKullanıcı adını yaz:", { parse_mode: "Markdown" });
+      return;
+    }
+
+    // ── SELF LOGIN (button) ──
+    if (data === "self_login") {
+      if (isLocked(session)) {
+        const rem = Math.ceil((session.lockedUntil - Date.now()) / 60000);
+        await send(chatId, `🔒 Kilitli. ${rem}dk bekle.`);
+        return;
+      }
+      pending[chatId] = { step: "login_user" };
+      await editMsg(chatId, msgId, "🔑 *Giriş*\n\nKullanıcı adını yaz:", { parse_mode: "Markdown" });
+      return;
+    }
+
+    // must be authed for everything below (except above)
     if (!session.authed || isSessionExpired(session)) {
       if (data !== "logout") {
-        await send(chatId, "⚠️ Oturum dolmuş. /login <kullanıcıadı> <şifre>");
+        await send(chatId, "Önce giriş yap.", {
+          reply_markup: JSON.stringify({
+            inline_keyboard: [
+              [{ text: "🟢 Kayıt Ol", callback_data: "self_register" }],
+              [{ text: "🔵 Giriş Yap", callback_data: "self_login" }],
+            ],
+          }),
+        });
         return;
       }
     }
@@ -390,6 +520,12 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
     const tgUser = msg.from.username || msg.from.first_name || "?";
     const session = getSession(chatId);
 
+    // Anti-flood check
+    if (!floodCheck(chatId)) {
+      logSecurity(chatId, tgUser, "FLOOD", "mesaj flood — susturuldu");
+      return; // silently drop flood messages
+    }
+
     // Auto-seed owner
     if (String(chatId) === String(ADMIN_ID)) seedOwner(chatId, tgUser);
 
@@ -404,23 +540,47 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
     if (text === "/start") {
       logActivity(chatId, tgUser, "START");
       const isOwner = String(chatId) === String(ADMIN_ID);
+
+      if (isOwner) {
+        // Owner auto-login
+        session.authed = true;
+        session.rank = "OWNER";
+        session.loginAttempts = 0;
+        session.lockedUntil = 0;
+        touchSession(session);
+        logActivity(chatId, tgUser, "LOGIN_OWNER");
+        await send(chatId,
+          `┌─────────────────────────┐\n` +
+          `│      🌐  NEXUS HUB      │\n` +
+          `│     Key Management       │\n` +
+          `└─────────────────────────┘\n\n` +
+          `👑 Hoş geldin, *${tgUser}*\n\n` +
+          `/menu ile paneli aç.`,
+          { parse_mode: "Markdown" });
+        return;
+      }
+
+      // Normal users — elegant welcome with register/login buttons
       await send(chatId,
-        `╔══════════════════════════════╗\n` +
-        `║       🌐 NEXUS HUB 🌐       ║\n` +
-        `╠══════════════════════════════╣\n` +
-        `║  Key Yönetim Sistemi v2.1    ║\n` +
-        `║  Kullanıcı Bazlı Giriş      ║\n` +
-        `╚══════════════════════════════╝\n\n` +
-        (isOwner
-          ? `👑 *OWNER tespit edildi!*\nOtomatik giriş: /login\n\n`
-          : `🔐 Giriş: /login <kullanıcıadı> <şifre>\n\n`) +
-        `⚠️ ${MAX_LOGIN_ATTEMPTS} yanlış = ${LOCKOUT_MINUTES}dk kilit`,
-        { parse_mode: "Markdown" }
+        `┌─────────────────────────┐\n` +
+        `│      🌐  NEXUS HUB      │\n` +
+        `│     Key Management       │\n` +
+        `└─────────────────────────┘\n\n` +
+        `Hoş geldin, *${tgUser}*`,
+        {
+          parse_mode: "Markdown",
+          reply_markup: JSON.stringify({
+            inline_keyboard: [
+              [{ text: "🟢 Kayıt Ol", callback_data: "self_register" }],
+              [{ text: "🔵 Giriş Yap", callback_data: "self_login" }],
+            ],
+          }),
+        }
       );
       return;
     }
 
-    // /login
+    // /login (text command fallback)
     if (text.startsWith("/login")) {
       const parts = text.split(/\s+/);
 
@@ -431,7 +591,7 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
         return;
       }
 
-      // OWNER — no password needed, just /login
+      // OWNER — auto login
       if (String(chatId) === String(ADMIN_ID)) {
         session.authed = true;
         session.rank = "OWNER";
@@ -439,28 +599,22 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
         session.lockedUntil = 0;
         touchSession(session);
         logActivity(chatId, tgUser, "LOGIN_OWNER");
-        await send(chatId,
-          `✅ *OWNER Giriş Başarılı!*\n\n👑 @${tgUser}\n⏱ Oturum: ${SESSION_TIMEOUT_MINUTES}dk\n\n/menu ile devam et.`,
-          { parse_mode: "Markdown" });
+        await send(chatId, `👑 *${tgUser}* — giriş yapıldı.\n\n/menu`, { parse_mode: "Markdown" });
         return;
       }
 
-      // Normal users: /login <username> <password>
+      // /login <username> <password>
       const uname = parts[1] || "";
       const pw = parts[2] || "";
 
       if (!uname || !pw) {
-        await send(chatId, "⚠️ Kullanım: /login <kullanıcıadı> <şifre>");
+        await send(chatId, "Kullanım: /login <kullanıcıadı> <şifre>");
         return;
       }
 
-      // find user by chatId or by username
-      let foundId = null;
       let foundUser = null;
-      for (const [id, u] of Object.entries(users)) {
-        if (u.username.toLowerCase() === uname.toLowerCase()) {
-          foundId = id; foundUser = u; break;
-        }
+      for (const [, u] of Object.entries(users)) {
+        if (u.username.toLowerCase() === uname.toLowerCase()) { foundUser = u; break; }
       }
 
       if (!foundUser || foundUser.password !== pw) {
@@ -470,32 +624,96 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
         if (session.loginAttempts >= MAX_LOGIN_ATTEMPTS) {
           session.lockedUntil = Date.now() + LOCKOUT_MINUTES * 60000;
           logSecurity(chatId, tgUser, "BRUTE_FORCE", `${MAX_LOGIN_ATTEMPTS} deneme — kilitlendi`);
-          await send(chatId, `🚨 ${LOCKOUT_MINUTES}dk kilitlendi!`);
+          await send(chatId, `🚨 ${LOCKOUT_MINUTES}dk kilitlendi.`);
           return;
         }
-        await send(chatId, `❌ Yanlış kullanıcı adı veya şifre. Kalan: ${rem}`);
+        await send(chatId, `❌ Hatalı bilgi. Kalan hak: ${rem}`);
         return;
       }
 
-      // Check if chatId matches (user must login from their own account)
-      // OR allow login from any chat but bind to the registered chatId
       session.authed = true;
       session.rank = foundUser.rank;
       session.loginAttempts = 0;
       session.lockedUntil = 0;
       touchSession(session);
       logActivity(chatId, tgUser, "LOGIN_OK", `as ${uname} | rank: ${foundUser.rank}`);
-      logSecurity(chatId, tgUser, "LOGIN_OK", `${uname} — ${foundUser.rank}`);
+      await send(chatId, `✅ *${uname}* — giriş yapıldı.\n🎖 ${foundUser.rank}\n\n/menu`, { parse_mode: "Markdown" });
+      return;
+    }
+
+    // /register (text command fallback)
+    if (text.startsWith("/register")) {
+      const parts = text.split(/\s+/);
+      const uname = parts[1] || "";
+      const pw = parts[2] || "";
+
+      if (!uname || !pw) {
+        await send(chatId, "Kullanım: /register <kullanıcıadı> <şifre>");
+        return;
+      }
+
+      if (uname.length < 3 || uname.length > 20) {
+        await send(chatId, "❌ Kullanıcı adı 3-20 karakter olmalı.");
+        return;
+      }
+      if (pw.length < 4) {
+        await send(chatId, "❌ Şifre en az 4 karakter olmalı.");
+        return;
+      }
+      if (!/^[a-zA-Z0-9_]+$/.test(uname)) {
+        await send(chatId, "❌ Kullanıcı adı sadece harf, rakam ve _ içerebilir.");
+        return;
+      }
+
+      // check duplicate chatId
+      if (users[chatId]) {
+        await send(chatId, `❌ Bu hesap zaten kayıtlı: *${users[chatId].username}*`, { parse_mode: "Markdown" });
+        return;
+      }
+      // check duplicate username
+      for (const u of Object.values(users)) {
+        if (u.username.toLowerCase() === uname.toLowerCase()) {
+          await send(chatId, "❌ Bu kullanıcı adı zaten alınmış.");
+          return;
+        }
+      }
+
+      users[chatId] = {
+        username: uname,
+        password: pw,
+        rank: "USER",
+        createdAt: new Date().toISOString(),
+        createdBy: "SELF",
+      };
+      logActivity(chatId, tgUser, "SELF_REGISTER", uname);
+      logSecurity(chatId, tgUser, "NEW_REGISTER", uname);
+
+      // Auto-login after register
+      session.authed = true;
+      session.rank = "USER";
+      session.loginAttempts = 0;
+      touchSession(session);
+
+      // Notify owner
+      send(ADMIN_ID, `📝 *Yeni Kayıt*\n\n👤 ${uname}\n🆔 \`${chatId}\`\nTelegram: @${tgUser}`, { parse_mode: "Markdown" });
+
       await send(chatId,
-        `✅ *Giriş Başarılı!*\n\n👤 ${uname}\n🎖 *${foundUser.rank}*\n⏱ ${SESSION_TIMEOUT_MINUTES}dk\n\n/menu`,
+        `✅ Kayıt tamamlandı.\n\n👤 *${uname}*\n🎖 USER\n\n/menu ile devam et.`,
         { parse_mode: "Markdown" });
       return;
     }
 
     // AUTH GATE
     if (!session.authed || isSessionExpired(session)) {
-      if (text.startsWith("/")) logSecurity(chatId, tgUser, "UNAUTH_CMD", text.slice(0, 40));
-      await send(chatId, "🔐 Giriş yapın: /login <kullanıcıadı> <şifre>");
+      if (text.startsWith("/") && text !== "/start") logSecurity(chatId, tgUser, "UNAUTH_CMD", text.slice(0, 40));
+      await send(chatId, "Önce giriş yap.", {
+        reply_markup: JSON.stringify({
+          inline_keyboard: [
+            [{ text: "🟢 Kayıt Ol", callback_data: "self_register" }],
+            [{ text: "🔵 Giriş Yap", callback_data: "self_login" }],
+          ],
+        }),
+      });
       return;
     }
     touchSession(session);
@@ -530,6 +748,107 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
     // ── PENDING TEXT INPUT FLOWS ──
     const pa = pending[chatId];
     if (pa) {
+      // SELF REGISTER — step 1: username
+      if (pa.step === "self_reg_user") {
+        const uname = text.trim();
+        if (uname.length < 3 || uname.length > 20 || !/^[a-zA-Z0-9_]+$/.test(uname)) {
+          await send(chatId, "❌ 3-20 karakter, sadece harf/rakam/alt çizgi. Tekrar yaz:");
+          return;
+        }
+        for (const u of Object.values(users)) {
+          if (u.username.toLowerCase() === uname.toLowerCase()) {
+            await send(chatId, "❌ Bu ad alınmış. Başka bir ad yaz:");
+            return;
+          }
+        }
+        pending[chatId] = { step: "self_reg_pass", username: uname };
+        await send(chatId, `👤 *${uname}*\n\nŞimdi şifreni yaz:`, { parse_mode: "Markdown" });
+        return;
+      }
+
+      // SELF REGISTER — step 2: password
+      if (pa.step === "self_reg_pass") {
+        const pw = text.trim();
+        if (pw.length < 4) {
+          await send(chatId, "❌ Şifre en az 4 karakter. Tekrar yaz:");
+          return;
+        }
+        const uname = pa.username;
+        delete pending[chatId];
+
+        if (users[chatId]) {
+          await send(chatId, "❌ Zaten kayıtlısın.");
+          return;
+        }
+
+        users[chatId] = {
+          username: uname,
+          password: pw,
+          rank: "USER",
+          createdAt: new Date().toISOString(),
+          createdBy: "SELF",
+        };
+        logActivity(chatId, tgUser, "SELF_REGISTER", uname);
+        logSecurity(chatId, tgUser, "NEW_REGISTER", uname);
+
+        session.authed = true;
+        session.rank = "USER";
+        session.loginAttempts = 0;
+        touchSession(session);
+
+        send(ADMIN_ID, `📝 *Yeni Kayıt*\n\n👤 ${uname}\n🆔 \`${chatId}\`\n@${tgUser}`, { parse_mode: "Markdown" });
+        await send(chatId, `✅ *${uname}* — kayıt tamamlandı.\n\n/menu ile devam et.`, { parse_mode: "Markdown" });
+        return;
+      }
+
+      // SELF LOGIN — step 1: username
+      if (pa.step === "login_user") {
+        pending[chatId] = { step: "login_pass", username: text.trim() };
+        await send(chatId, "Şifreni yaz:");
+        return;
+      }
+
+      // SELF LOGIN — step 2: password
+      if (pa.step === "login_pass") {
+        const uname = pa.username;
+        const pw = text.trim();
+        delete pending[chatId];
+
+        if (isLocked(session)) {
+          const rem = Math.ceil((session.lockedUntil - Date.now()) / 60000);
+          await send(chatId, `🔒 ${rem}dk kilitli.`);
+          return;
+        }
+
+        let foundUser = null;
+        for (const [, u] of Object.entries(users)) {
+          if (u.username.toLowerCase() === uname.toLowerCase()) { foundUser = u; break; }
+        }
+
+        if (!foundUser || foundUser.password !== pw) {
+          session.loginAttempts++;
+          const rem = MAX_LOGIN_ATTEMPTS - session.loginAttempts;
+          logSecurity(chatId, tgUser, "FAILED_LOGIN", `user: ${uname} | ${session.loginAttempts}/${MAX_LOGIN_ATTEMPTS}`);
+          if (session.loginAttempts >= MAX_LOGIN_ATTEMPTS) {
+            session.lockedUntil = Date.now() + LOCKOUT_MINUTES * 60000;
+            logSecurity(chatId, tgUser, "BRUTE_FORCE", `${MAX_LOGIN_ATTEMPTS} deneme — kilitlendi`);
+            await send(chatId, `🚨 ${LOCKOUT_MINUTES}dk kilitlendi.`);
+            return;
+          }
+          await send(chatId, `❌ Hatalı bilgi. Kalan: ${rem}`);
+          return;
+        }
+
+        session.authed = true;
+        session.rank = foundUser.rank;
+        session.loginAttempts = 0;
+        session.lockedUntil = 0;
+        touchSession(session);
+        logActivity(chatId, tgUser, "LOGIN_OK", `${uname} | ${foundUser.rank}`);
+        await send(chatId, `✅ *${uname}* — giriş yapıldı.\n🎖 ${foundUser.rank}\n\n/menu`, { parse_mode: "Markdown" });
+        return;
+      }
+
       // ADD USER
       if (pa.step === "add_user") {
         delete pending[chatId];
@@ -684,18 +1003,36 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
   }
 });
 
-// ─── API ────────────────────────────────────────────────────
+// ─── API (rate limited) ─────────────────────────────────────
 app.get("/ping", (req, res) => {
+  const ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress || "?";
+  if (!rateCheck(ip, RATE_MAX_API)) {
+    return res.status(429).json({ status: "error", message: "rate limit" });
+  }
   res.json({ status: "ok", maintenance, announcement, uptime: process.uptime(), keys: Object.values(keys).filter(v => v.status === "ok").length, users: Object.keys(users).length });
 });
 
 app.get("/check", (req, res) => {
-  const key = (req.query.key || "").trim().toUpperCase();
   const ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress || "?";
+
+  // Rate limit
+  if (!rateCheck(ip, RATE_MAX_API)) {
+    logSecurity("API", ip, "RATE_LIMIT", "API flood");
+    return res.status(429).json({ status: "error", message: "çok fazla istek" });
+  }
+
+  const key = (req.query.key || "").trim().toUpperCase();
   if (!key) return res.json({ status: "error", message: "key yok" });
+
+  // Key format validation — must match NEXUS-XXX-XXXXXX
+  if (!/^NEXUS-(DAY|WEEK|MONTH|PERM)-[A-F0-9]{6}$/.test(key)) {
+    logSecurity("API", ip, "MALFORMED_KEY", key.slice(0, 20));
+    return res.json({ status: "invalid", message: "geçersiz format" });
+  }
+
   const entry = keys[key];
   if (!entry) {
-    logSecurity("API", ip, "INVALID_KEY", key.slice(0, 12));
+    logSecurity("API", ip, "INVALID_KEY", key.slice(0, 16));
     return res.json({ status: "invalid" });
   }
   if (entry.expire && Date.now() > entry.expire) {
@@ -704,6 +1041,13 @@ app.get("/check", (req, res) => {
   }
   logActivity("API", ip, "KEY_OK", `${key} | ${entry.rank} | ${entry.game}`);
   res.json({ status: "ok", rank: entry.rank, game: entry.game, expire: entry.expire || null });
+});
+
+// Block all other routes — don't expose anything
+app.use((req, res) => {
+  const ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress || "?";
+  logSecurity("HTTP", ip, "UNKNOWN_ROUTE", `${req.method} ${req.path}`);
+  res.status(404).json({ error: "bulunamadı" });
 });
 
 // ─── WEBHOOK SETUP ──────────────────────────────────────────
@@ -723,4 +1067,4 @@ setInterval(() => {
 }, 600000);
 
 // START
-app.listen(PORT, () => { console.log(`NEXUS H
+app.listen(PORT, () => { console.log(`NEXUS HUB v2.1 :${PORT}`); setupWebhook(); });
