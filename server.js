@@ -703,6 +703,96 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
       return;
     }
 
+    // ── AUTH-EXEMPT PENDING FLOWS (register/login text input) ──
+    const pAuth = pending[chatId];
+    if (pAuth) {
+      if (pAuth.step === "self_reg_user") {
+        const uname = text.trim();
+        if (uname.length < 3 || uname.length > 20 || !/^[a-zA-Z0-9_]+$/.test(uname)) {
+          await send(chatId, "❌ 3-20 karakter, sadece harf/rakam/alt çizgi. Tekrar yaz:");
+          return;
+        }
+        for (const u of Object.values(users)) {
+          if (u.username.toLowerCase() === uname.toLowerCase()) {
+            await send(chatId, "❌ Bu ad alınmış. Başka bir ad yaz:");
+            return;
+          }
+        }
+        pending[chatId] = { step: "self_reg_pass", username: uname };
+        await send(chatId, `👤 *${uname}*\n\nŞimdi şifreni yaz:`, { parse_mode: "Markdown" });
+        return;
+      }
+      if (pAuth.step === "self_reg_pass") {
+        const pw = text.trim();
+        if (pw.length < 4) {
+          await send(chatId, "❌ Şifre en az 4 karakter. Tekrar yaz:");
+          return;
+        }
+        const uname = pAuth.username;
+        delete pending[chatId];
+        if (users[chatId]) {
+          await send(chatId, "❌ Zaten kayıtlısın.");
+          return;
+        }
+        users[chatId] = {
+          username: uname,
+          password: pw,
+          rank: "USER",
+          createdAt: new Date().toISOString(),
+          createdBy: "SELF",
+        };
+        logActivity(chatId, tgUser, "SELF_REGISTER", uname);
+        logSecurity(chatId, tgUser, "NEW_REGISTER", uname);
+        session.authed = true;
+        session.rank = "USER";
+        session.loginAttempts = 0;
+        touchSession(session);
+        send(ADMIN_ID, `📝 *Yeni Kayıt*\n\n👤 ${uname}\n🆔 \`${chatId}\`\n@${tgUser}`, { parse_mode: "Markdown" });
+        await send(chatId, `✅ *${uname}* — kayıt tamamlandı.\n\n/menu ile devam et.`, { parse_mode: "Markdown" });
+        return;
+      }
+      if (pAuth.step === "login_user") {
+        pending[chatId] = { step: "login_pass", username: text.trim() };
+        await send(chatId, "Şifreni yaz:");
+        return;
+      }
+      if (pAuth.step === "login_pass") {
+        const uname = pAuth.username;
+        const pw = text.trim();
+        delete pending[chatId];
+        if (isLocked(session)) {
+          const rem = Math.ceil((session.lockedUntil - Date.now()) / 60000);
+          await send(chatId, `🔒 ${rem}dk kilitli.`);
+          return;
+        }
+        let foundUser = null;
+        for (const [, u] of Object.entries(users)) {
+          if (u.username.toLowerCase() === uname.toLowerCase()) { foundUser = u; break; }
+        }
+        if (!foundUser || foundUser.password !== pw) {
+          session.loginAttempts++;
+          const rem = MAX_LOGIN_ATTEMPTS - session.loginAttempts;
+          logSecurity(chatId, tgUser, "FAILED_LOGIN", `user: ${uname} | ${session.loginAttempts}/${MAX_LOGIN_ATTEMPTS}`);
+          if (session.loginAttempts >= MAX_LOGIN_ATTEMPTS) {
+            session.lockedUntil = Date.now() + LOCKOUT_MINUTES * 60000;
+            logSecurity(chatId, tgUser, "BRUTE_FORCE", `${MAX_LOGIN_ATTEMPTS} deneme — kilitlendi`);
+            await send(chatId, `🚨 ${LOCKOUT_MINUTES}dk kilitlendi.`);
+            return;
+          }
+          await send(chatId, `❌ Hatalı bilgi. Kalan: ${rem}`);
+          return;
+        }
+        session.authed = true;
+        session.rank = foundUser.rank;
+        session.loginAttempts = 0;
+        session.lockedUntil = 0;
+        touchSession(session);
+        logActivity(chatId, tgUser, "LOGIN_OK", `${uname} | ${foundUser.rank}`);
+        await send(chatId, `✅ *${uname}* — giriş yapıldı.\n🎖 ${foundUser.rank}\n\n/menu`, { parse_mode: "Markdown" });
+        return;
+      }
+    }
+
     // AUTH GATE
     if (!session.authed || isSessionExpired(session)) {
       if (text.startsWith("/") && text !== "/start") logSecurity(chatId, tgUser, "UNAUTH_CMD", text.slice(0, 40));
@@ -745,110 +835,9 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
       return;
     }
 
-    // ── PENDING TEXT INPUT FLOWS ──
+    // ── PENDING TEXT INPUT FLOWS (authed) ──
     const pa = pending[chatId];
     if (pa) {
-      // SELF REGISTER — step 1: username
-      if (pa.step === "self_reg_user") {
-        const uname = text.trim();
-        if (uname.length < 3 || uname.length > 20 || !/^[a-zA-Z0-9_]+$/.test(uname)) {
-          await send(chatId, "❌ 3-20 karakter, sadece harf/rakam/alt çizgi. Tekrar yaz:");
-          return;
-        }
-        for (const u of Object.values(users)) {
-          if (u.username.toLowerCase() === uname.toLowerCase()) {
-            await send(chatId, "❌ Bu ad alınmış. Başka bir ad yaz:");
-            return;
-          }
-        }
-        pending[chatId] = { step: "self_reg_pass", username: uname };
-        await send(chatId, `👤 *${uname}*\n\nŞimdi şifreni yaz:`, { parse_mode: "Markdown" });
-        return;
-      }
-
-      // SELF REGISTER — step 2: password
-      if (pa.step === "self_reg_pass") {
-        const pw = text.trim();
-        if (pw.length < 4) {
-          await send(chatId, "❌ Şifre en az 4 karakter. Tekrar yaz:");
-          return;
-        }
-        const uname = pa.username;
-        delete pending[chatId];
-
-        if (users[chatId]) {
-          await send(chatId, "❌ Zaten kayıtlısın.");
-          return;
-        }
-
-        users[chatId] = {
-          username: uname,
-          password: pw,
-          rank: "USER",
-          createdAt: new Date().toISOString(),
-          createdBy: "SELF",
-        };
-        logActivity(chatId, tgUser, "SELF_REGISTER", uname);
-        logSecurity(chatId, tgUser, "NEW_REGISTER", uname);
-
-        session.authed = true;
-        session.rank = "USER";
-        session.loginAttempts = 0;
-        touchSession(session);
-
-        send(ADMIN_ID, `📝 *Yeni Kayıt*\n\n👤 ${uname}\n🆔 \`${chatId}\`\n@${tgUser}`, { parse_mode: "Markdown" });
-        await send(chatId, `✅ *${uname}* — kayıt tamamlandı.\n\n/menu ile devam et.`, { parse_mode: "Markdown" });
-        return;
-      }
-
-      // SELF LOGIN — step 1: username
-      if (pa.step === "login_user") {
-        pending[chatId] = { step: "login_pass", username: text.trim() };
-        await send(chatId, "Şifreni yaz:");
-        return;
-      }
-
-      // SELF LOGIN — step 2: password
-      if (pa.step === "login_pass") {
-        const uname = pa.username;
-        const pw = text.trim();
-        delete pending[chatId];
-
-        if (isLocked(session)) {
-          const rem = Math.ceil((session.lockedUntil - Date.now()) / 60000);
-          await send(chatId, `🔒 ${rem}dk kilitli.`);
-          return;
-        }
-
-        let foundUser = null;
-        for (const [, u] of Object.entries(users)) {
-          if (u.username.toLowerCase() === uname.toLowerCase()) { foundUser = u; break; }
-        }
-
-        if (!foundUser || foundUser.password !== pw) {
-          session.loginAttempts++;
-          const rem = MAX_LOGIN_ATTEMPTS - session.loginAttempts;
-          logSecurity(chatId, tgUser, "FAILED_LOGIN", `user: ${uname} | ${session.loginAttempts}/${MAX_LOGIN_ATTEMPTS}`);
-          if (session.loginAttempts >= MAX_LOGIN_ATTEMPTS) {
-            session.lockedUntil = Date.now() + LOCKOUT_MINUTES * 60000;
-            logSecurity(chatId, tgUser, "BRUTE_FORCE", `${MAX_LOGIN_ATTEMPTS} deneme — kilitlendi`);
-            await send(chatId, `🚨 ${LOCKOUT_MINUTES}dk kilitlendi.`);
-            return;
-          }
-          await send(chatId, `❌ Hatalı bilgi. Kalan: ${rem}`);
-          return;
-        }
-
-        session.authed = true;
-        session.rank = foundUser.rank;
-        session.loginAttempts = 0;
-        session.lockedUntil = 0;
-        touchSession(session);
-        logActivity(chatId, tgUser, "LOGIN_OK", `${uname} | ${foundUser.rank}`);
-        await send(chatId, `✅ *${uname}* — giriş yapıldı.\n🎖 ${foundUser.rank}\n\n/menu`, { parse_mode: "Markdown" });
-        return;
-      }
-
       // ADD USER
       if (pa.step === "add_user") {
         delete pending[chatId];
