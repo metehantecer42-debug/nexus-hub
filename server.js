@@ -1216,232 +1216,189 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
           return;
         }
 
-        await send(chatId, "⏳ Delta bypass çalışıyor, birkaç saniye bekle...");
+        await send(chatId, "⏳ Bypass çalışıyor...");
 
         // === METHOD 0: If it's already a platoboost/gateway URL, extract key directly ===
         if (linkType === "platoboost") {
           deltaKey = extractDeltaKey(link);
         }
 
-        // === METHOD 1: Paid bypass API (most reliable) ===
         const BYPASS_API_KEY = process.env.BYPASS_API_KEY || "";
-        if (!bypassUrl && !deltaKey && BYPASS_API_KEY) {
-          try {
-            const r = await fetch("https://bypass-links.com/api/v1/bypass", {
-              method: "POST",
-              headers: {
-                "x-api-key": BYPASS_API_KEY,
-                "Content-Type": "application/json",
-              },
-              body: JSON.stringify({ url: link }),
-              signal: AbortSignal.timeout(15000),
-            });
-            if (r.ok) {
-              const d = await r.json();
-              if (d.success && d.direct && !isJunk(d.direct) && !isBlockedDomain(d.direct)) {
-                deltaKey = extractDeltaKey(d.direct);
-                if (!deltaKey) bypassUrl = d.direct;
-              }
-            }
-          } catch {}
-        }
 
-        // === METHOD 2: Direct page scrape + redirect follow ===
-        if (!bypassUrl && !deltaKey) {
-          try {
+        // === ALL METHODS RUN IN PARALLEL — first valid result wins ===
+        if (!deltaKey) {
+          // helper: wrap each method as a promise that resolves {key,url} or null
+          const T = 8000; // global timeout per method
+
+          const scrapeMethod = async () => {
             const r = await fetch(link, {
               redirect: "follow",
               headers: {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.9,tr;q=0.8",
+                "Accept": "text/html,*/*;q=0.8",
                 "Referer": "https://www.google.com/",
-                "Sec-Fetch-Dest": "document",
-                "Sec-Fetch-Mode": "navigate",
-                "Sec-Fetch-Site": "cross-site",
               },
-              signal: AbortSignal.timeout(12000),
+              signal: AbortSignal.timeout(T),
             });
             const html = await r.text();
-
-            // extract destination/target URL from page source
             const extractPatterns = [
               /["']destination["']\s*[:=]\s*["'](https?:\/\/[^"']+)["']/i,
               /["']targetUrl["']\s*[:=]\s*["'](https?:\/\/[^"']+)["']/i,
               /["']target["']\s*[:=]\s*["'](https?:\/\/[^"']+)["']/i,
               /data-target\s*=\s*["'](https?:\/\/[^"']+)["']/i,
               /data-url\s*=\s*["'](https?:\/\/[^"']+)["']/i,
-              /data-href\s*=\s*["'](https?:\/\/[^"']+)["']/i,
               /window\.location(?:\.href)?\s*=\s*["'](https?:\/\/[^"']+)["']/i,
-              /window\.open\s*\(\s*["'](https?:\/\/[^"']+)["']/i,
               /redirect(?:Url|_url|URL)\s*[:=]\s*["'](https?:\/\/[^"']+)["']/i,
-              /next(?:Url|_url|URL)\s*[:=]\s*["'](https?:\/\/[^"']+)["']/i,
-              /continue(?:Url|_url|URL)\s*[:=]\s*["'](https?:\/\/[^"']+)["']/i,
-              /(?:final|real|actual)(?:Url|_url|URL|Link|_link)\s*[:=]\s*["'](https?:\/\/[^"']+)["']/i,
               /href\s*=\s*["'](https?:\/\/gateway\.platoboost[^"']+)["']/i,
               /["']url["']\s*:\s*["'](https?:\/\/gateway[^"']+)["']/i,
             ];
-
             for (const pat of extractPatterns) {
               const m = html.match(pat);
-              if (m && m[1]) {
-                const candidate = m[1];
-                if (!isBlockedDomain(candidate) && !isJunk(candidate)) {
-                  deltaKey = extractDeltaKey(candidate);
-                  if (!deltaKey) bypassUrl = candidate;
-                  break;
+              if (m && m[1] && !isBlockedDomain(m[1]) && !isJunk(m[1])) {
+                const k = extractDeltaKey(m[1]);
+                if (k) return { key: k };
+                return { url: m[1] };
+              }
+            }
+            // key patterns in page
+            const keyPats = [
+              /platoboost[^"']*\?[^"']*key=([A-Za-z0-9_\-]{8,64})/i,
+              /["']?key["']?\s*[:=]\s*["']([A-Za-z0-9_\-]{8,64})["']/,
+              /delta[_\-]?key\s*[:=]\s*["']([^"']{8,64})["']/i,
+            ];
+            for (const pat of keyPats) {
+              const m = html.match(pat);
+              if (m && m[1] && m[1].length >= 8) return { key: m[1] };
+            }
+            // redirect destination
+            if (r.url !== link && !isBlockedDomain(r.url) && !isJunk(r.url)) {
+              const k = extractDeltaKey(r.url);
+              if (k) return { key: k };
+              return { url: r.url };
+            }
+            // base64
+            const b64s = html.matchAll(/atob\s*\(\s*["']([A-Za-z0-9+/=]{16,})["']\s*\)/g);
+            for (const m of b64s) {
+              try {
+                const d = Buffer.from(m[1], "base64").toString("utf8");
+                if (d.startsWith("http") && !isJunk(d) && !isBlockedDomain(d)) {
+                  const k = extractDeltaKey(d);
+                  if (k) return { key: k };
+                  return { url: d };
                 }
-              }
+              } catch {}
             }
+            return null;
+          };
 
-            // try extracting delta key directly from page source
-            if (!bypassUrl && !deltaKey) {
-              const keyPatterns = [
-                /["']?key["']?\s*[:=]\s*["']([A-Za-z0-9_\-]{8,64})["']/,
-                /delta[_\-]?key\s*[:=]\s*["']([^"']{8,64})["']/i,
-                /getKey.*?["']([A-Za-z0-9_\-]{16,64})["']/i,
-                /token\s*[:=]\s*["']([A-Za-z0-9_\-]{16,64})["']/i,
-                /platoboost[^"']*\?[^"']*key=([A-Za-z0-9_\-]{8,64})/i,
-              ];
-              for (const pat of keyPatterns) {
-                const m = html.match(pat);
-                if (m && m[1] && m[1].length >= 8) {
-                  deltaKey = m[1];
-                  break;
-                }
-              }
-            }
-
-            // check redirect chain destination
-            if (!bypassUrl && !deltaKey && r.url !== link) {
-              if (!isBlockedDomain(r.url) && !isJunk(r.url)) {
-                deltaKey = extractDeltaKey(r.url);
-                if (!deltaKey) bypassUrl = r.url;
-              }
-            }
-
-            // try base64 encoded destinations
-            if (!bypassUrl && !deltaKey) {
-              const b64matches = html.matchAll(/atob\s*\(\s*["']([A-Za-z0-9+/=]{16,})["']\s*\)/g);
-              for (const m of b64matches) {
-                try {
-                  const decoded = Buffer.from(m[1], "base64").toString("utf8");
-                  if (decoded.startsWith("http") && !isJunk(decoded) && !isBlockedDomain(decoded)) {
-                    deltaKey = extractDeltaKey(decoded);
-                    if (!deltaKey) bypassUrl = decoded;
-                    break;
-                  }
-                } catch {}
-              }
-            }
-
-            // try JSON embedded in page (some link gates put destination in JSON)
-            if (!bypassUrl && !deltaKey) {
-              const jsonMatches = html.matchAll(/\{[^{}]*"(?:destination|target|url|redirect|next)":\s*"(https?:\/\/[^"]+)"[^{}]*\}/g);
-              for (const m of jsonMatches) {
-                if (m[1] && !isJunk(m[1]) && !isBlockedDomain(m[1])) {
-                  deltaKey = extractDeltaKey(m[1]);
-                  if (!deltaKey) bypassUrl = m[1];
-                  break;
-                }
-              }
-            }
-          } catch {}
-        }
-
-        // === METHOD 3: Free bypass APIs (filtered, multiple fallbacks) ===
-        if (!bypassUrl && !deltaKey) {
-          const freeApis = [
-            { url: `https://bypass.bot.nu/bypass2?url=${encodeURIComponent(link)}`, method: "GET", json: true },
-            { url: `https://bypass-api.vercel.app/api?url=${encodeURIComponent(link)}`, method: "GET", json: true },
-            { url: `https://api.bypass.vip/bypass?url=${encodeURIComponent(link)}`, method: "GET", json: true },
-          ];
-          for (const api of freeApis) {
-            if (bypassUrl || deltaKey) break;
+          const apiMethod = async (apiUrl) => {
+            const r = await fetch(apiUrl, {
+              headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json, text/plain" },
+              signal: AbortSignal.timeout(T),
+            });
+            if (!r.ok) return null;
+            let result = null;
             try {
-              const r = await fetch(api.url, {
-                method: api.method,
-                headers: {
-                  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                  "Accept": "application/json, text/plain, */*",
-                },
-                signal: AbortSignal.timeout(10000),
-              });
-              if (r.ok) {
-                const ct = r.headers.get("content-type") || "";
-                let result = null;
-                if (ct.includes("json") || api.json) {
-                  try {
-                    const d = await r.json();
-                    result = d.destination || d.result || d.bypassed || d.url || d.target
-                           || d.dest || d.direct || d.resolved || d.link || null;
-                    if (typeof result === "object") result = null;
-                  } catch {
-                    const t = await r.text();
-                    if (t.startsWith("http")) result = t.trim().split("\n")[0];
-                  }
-                } else {
-                  const t = await r.text();
-                  if (t.startsWith("http")) result = t.trim().split("\n")[0];
-                }
-                if (result && !isJunk(result) && !isBlockedDomain(result)) {
-                  deltaKey = extractDeltaKey(result);
-                  if (!deltaKey) bypassUrl = result;
-                }
-              }
+              const d = await r.json();
+              result = d.destination || d.result || d.bypassed || d.url || d.target || d.dest || d.direct || d.resolved || d.link || null;
+              if (typeof result === "object") result = null;
             } catch {}
-          }
-        }
+            if (result && !isJunk(result) && !isBlockedDomain(result)) {
+              const k = extractDeltaKey(result);
+              if (k) return { key: k };
+              return { url: result };
+            }
+            return null;
+          };
 
-        // === METHOD 4: Manual redirect chain following (up to 5 hops) ===
-        if (!bypassUrl && !deltaKey) {
-          try {
-            let currentUrl = link;
-            for (let hop = 0; hop < 5; hop++) {
-              const r = await fetch(currentUrl, {
+          const paidApiMethod = async () => {
+            if (!BYPASS_API_KEY) return null;
+            const r = await fetch("https://bypass-links.com/api/v1/bypass", {
+              method: "POST",
+              headers: { "x-api-key": BYPASS_API_KEY, "Content-Type": "application/json" },
+              body: JSON.stringify({ url: link }),
+              signal: AbortSignal.timeout(T),
+            });
+            if (!r.ok) return null;
+            const d = await r.json();
+            if (d.success && d.direct && !isJunk(d.direct) && !isBlockedDomain(d.direct)) {
+              const k = extractDeltaKey(d.direct);
+              if (k) return { key: k };
+              return { url: d.direct };
+            }
+            return null;
+          };
+
+          const redirectMethod = async () => {
+            let cur = link;
+            for (let i = 0; i < 4; i++) {
+              const r = await fetch(cur, {
                 redirect: "manual",
-                headers: {
-                  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                  "Accept": "text/html,*/*",
-                },
-                signal: AbortSignal.timeout(8000),
+                headers: { "User-Agent": "Mozilla/5.0" },
+                signal: AbortSignal.timeout(5000),
               });
               const loc = r.headers.get("location");
               if (!loc || !loc.startsWith("http")) break;
-
-              // check if this redirect lands on the destination
               if (!isBlockedDomain(loc) && !isJunk(loc)) {
-                deltaKey = extractDeltaKey(loc);
-                if (deltaKey) break;
-                bypassUrl = loc;
-                break;
+                const k = extractDeltaKey(loc);
+                if (k) return { key: k };
+                return { url: loc };
               }
-              currentUrl = loc;
+              cur = loc;
             }
-          } catch {}
+            return null;
+          };
+
+          // fire all methods at once — first non-null wins
+          const enc = encodeURIComponent(link);
+          const methods = [
+            scrapeMethod().catch(() => null),
+            apiMethod(`https://bypass.bot.nu/bypass2?url=${enc}`).catch(() => null),
+            apiMethod(`https://bypass-api.vercel.app/api?url=${enc}`).catch(() => null),
+            apiMethod(`https://api.bypass.vip/bypass?url=${enc}`).catch(() => null),
+            paidApiMethod().catch(() => null),
+            redirectMethod().catch(() => null),
+          ];
+
+          // race: first valid result, or wait for all if none wins early
+          const raceResult = await new Promise((resolve) => {
+            let settled = false;
+            let done = 0;
+            const total = methods.length;
+            for (const p of methods) {
+              p.then((r) => {
+                if (!settled && r && (r.key || r.url)) { settled = true; resolve(r); }
+                done++;
+                if (done >= total && !settled) { settled = true; resolve(null); }
+              });
+            }
+            // hard cap: 12 seconds max
+            setTimeout(() => { if (!settled) { settled = true; resolve(null); } }, 12000);
+          });
+
+          if (raceResult) {
+            if (raceResult.key) deltaKey = raceResult.key;
+            else if (raceResult.url) bypassUrl = raceResult.url;
+          }
         }
 
-        // === METHOD 5: Try fetching the bypass URL itself for another redirect ===
+        // === BONUS: if we got a URL but no key, quickly check that URL for a key ===
         if (bypassUrl && !deltaKey) {
-          try {
-            const r = await fetch(bypassUrl, {
-              redirect: "follow",
-              headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" },
-              signal: AbortSignal.timeout(8000),
-            });
-            // check final URL for key
-            if (r.url !== bypassUrl) {
-              const k = extractDeltaKey(r.url);
-              if (k) { deltaKey = k; bypassUrl = null; }
-            }
-            // check page for key
-            if (!deltaKey) {
-              const html = await r.text();
-              const keyMatch = html.match(/platoboost[^"']*\?[^"']*key=([A-Za-z0-9_\-]{8,64})/i)
-                           || html.match(/["']?key["']?\s*[:=]\s*["']([A-Za-z0-9_\-]{8,64})["']/);
-              if (keyMatch && keyMatch[1]) { deltaKey = keyMatch[1]; bypassUrl = null; }
-            }
-          } catch {}
+          const k = extractDeltaKey(bypassUrl);
+          if (k) { deltaKey = k; bypassUrl = null; }
+          else {
+            try {
+              const r = await fetch(bypassUrl, {
+                redirect: "follow",
+                headers: { "User-Agent": "Mozilla/5.0" },
+                signal: AbortSignal.timeout(5000),
+              });
+              if (r.url !== bypassUrl) {
+                const k2 = extractDeltaKey(r.url);
+                if (k2) { deltaKey = k2; bypassUrl = null; }
+              }
+            } catch {}
+          }
         }
 
         logActivity(chatId, tgUser, "DELTA_BYPASS", `${linkType} | ${deltaKey ? "KEY" : bypassUrl ? "URL" : "FAIL"}`);
