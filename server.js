@@ -1145,18 +1145,57 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
         let linkType = null;
         let deltaKey = null;
 
-        // junk filter — reject fake/promo responses
+        // === JUNK FILTER — reject fake/promo/ad responses ===
         const junkPatterns = [
           /discord\.gg/i, /discord\.com/i, /join here/i, /shut down/i,
           /leechers/i, /patreon/i, /donate/i, /premium/i, /subscribe/i,
-          /t\.me\//i, /telegram/i,
+          /t\.me\//i, /telegram/i, /free api/i, /working bypass/i,
+          /join.*?server/i, /click.*?here/i, /support.*?us/i,
+          /buy.*?premium/i, /upgrade/i, /giveaway/i,
         ];
         function isJunk(str) {
           if (!str || typeof str !== "string") return true;
-          if (str.length > 500) return true;
+          if (str.length > 600) return true;
           if (!str.startsWith("http")) return true;
           for (const p of junkPatterns) { if (p.test(str)) return true; }
           return false;
+        }
+
+        // blocked domains — link shortener / ad gate domains (not destinations)
+        const blockedDomains = [
+          "lootlabs", "lootdest", "loot-link", "loot-dest", "platorelay",
+          "linkvertise", "link-to", "direct-link", "link-center", "link-hub",
+          "link-target", "socialwolvez", "sub2get", "sub2unlock",
+          "google.com", "facebook.com", "twitter.com", "youtube.com",
+        ];
+        function isBlockedDomain(url) {
+          try {
+            const host = new URL(url).hostname.toLowerCase();
+            return blockedDomains.some(d => host.includes(d));
+          } catch { return false; }
+        }
+
+        // Delta key extraction from any URL — gateway.platoboost.com pattern
+        function extractDeltaKey(url) {
+          try {
+            const u = new URL(url);
+            // gateway.platoboost.com/?id=xxx — the key is in the URL hash or params
+            if (u.hostname.includes("platoboost") || u.hostname.includes("gateway")) {
+              const k = u.searchParams.get("key") || u.searchParams.get("token") || u.searchParams.get("tk");
+              if (k && k.length >= 8) return k;
+            }
+            // generic key extraction from any URL
+            for (const param of ["key", "token", "code", "tk", "k"]) {
+              const v = u.searchParams.get(param);
+              if (v && v.length >= 8 && /^[A-Za-z0-9_\-]+$/.test(v)) return v;
+            }
+            // key in URL hash
+            if (u.hash && u.hash.length > 8) {
+              const h = u.hash.replace("#", "");
+              if (/^[A-Za-z0-9_\-]+$/.test(h) && h.length >= 8) return h;
+            }
+          } catch {}
+          return null;
         }
 
         // detect link type
@@ -1167,155 +1206,240 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
             linkType = "linkvertise";
           } else if (host.includes("lootlabs") || host.includes("lootlab") || host.includes("loot-link") || host.includes("lootdest") || host.includes("platorelay")) {
             linkType = "lootlabs";
+          } else if (host.includes("platoboost") || host.includes("gateway")) {
+            linkType = "platoboost";
           } else {
-            linkType = "unknown";
+            linkType = "other";
           }
         } catch {
-          await send(chatId, "❌ Geçersiz URL. Tam linki yapıştır.");
+          await send(chatId, "❌ Geçersiz link. Tam URL'yi yapıştır (https:// ile başlamalı).");
           return;
         }
 
-        await send(chatId, "⏳ Bypass deneniyor...");
+        await send(chatId, "⏳ Delta bypass çalışıyor, birkaç saniye bekle...");
 
-        // === METHOD 1: direct page scrape + redirect follow ===
-        try {
-          const r = await fetch(link, {
-            redirect: "follow",
-            headers: {
-              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-              "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-              "Accept-Language": "en-US,en;q=0.9",
-              "Referer": "https://www.google.com/",
-            },
-            signal: AbortSignal.timeout(12000),
-          });
-          const html = await r.text();
+        // === METHOD 0: If it's already a platoboost/gateway URL, extract key directly ===
+        if (linkType === "platoboost") {
+          deltaKey = extractDeltaKey(link);
+        }
 
-          // extract destination/target URL from page source
-          const extractPatterns = [
-            /["']destination["']\s*[:=]\s*["'](https?:\/\/[^"']+)["']/i,
-            /["']targetUrl["']\s*[:=]\s*["'](https?:\/\/[^"']+)["']/i,
-            /["']target["']\s*[:=]\s*["'](https?:\/\/[^"']+)["']/i,
-            /data-target\s*=\s*["'](https?:\/\/[^"']+)["']/i,
-            /data-url\s*=\s*["'](https?:\/\/[^"']+)["']/i,
-            /data-href\s*=\s*["'](https?:\/\/[^"']+)["']/i,
-            /window\.location(?:\.href)?\s*=\s*["'](https?:\/\/[^"']+)["']/i,
-            /window\.open\s*\(\s*["'](https?:\/\/[^"']+)["']/i,
-            /redirect(?:Url|_url|URL)\s*[:=]\s*["'](https?:\/\/[^"']+)["']/i,
-            /next(?:Url|_url|URL)\s*[:=]\s*["'](https?:\/\/[^"']+)["']/i,
-            /continue(?:Url|_url|URL)\s*[:=]\s*["'](https?:\/\/[^"']+)["']/i,
-            /(?:final|real|actual)(?:Url|_url|URL|Link|_link)\s*[:=]\s*["'](https?:\/\/[^"']+)["']/i,
-          ];
-
-          const blockedDomains = ["lootlabs", "lootdest", "loot-link", "platorelay", "linkvertise", "link-to", "direct-link", "link-center", "link-hub", "google.com", "facebook.com", "twitter.com"];
-
-          for (const pat of extractPatterns) {
-            const m = html.match(pat);
-            if (m && m[1]) {
-              const candidate = m[1];
-              const blocked = blockedDomains.some(d => candidate.includes(d));
-              if (!blocked && !isJunk(candidate)) {
-                bypassUrl = candidate;
-                break;
+        // === METHOD 1: Paid bypass API (most reliable) ===
+        const BYPASS_API_KEY = process.env.BYPASS_API_KEY || "";
+        if (!bypassUrl && !deltaKey && BYPASS_API_KEY) {
+          try {
+            const r = await fetch("https://bypass-links.com/api/v1/bypass", {
+              method: "POST",
+              headers: {
+                "x-api-key": BYPASS_API_KEY,
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({ url: link }),
+              signal: AbortSignal.timeout(15000),
+            });
+            if (r.ok) {
+              const d = await r.json();
+              if (d.success && d.direct && !isJunk(d.direct) && !isBlockedDomain(d.direct)) {
+                deltaKey = extractDeltaKey(d.direct);
+                if (!deltaKey) bypassUrl = d.direct;
               }
             }
-          }
+          } catch {}
+        }
 
-          // try extracting delta key directly from page
-          if (!bypassUrl) {
-            const keyPatterns = [
-              /["']?key["']?\s*[:=]\s*["']([A-Za-z0-9_\-]{8,})["']/,
-              /delta[_\-]?key\s*[:=]\s*["']([^"']+)["']/i,
-              /getKey.*?["']([A-Za-z0-9_\-]{16,})["']/i,
-              /token\s*[:=]\s*["']([A-Za-z0-9_\-]{16,})["']/i,
-            ];
-            for (const pat of keyPatterns) {
-              const m = html.match(pat);
-              if (m && m[1] && m[1].length >= 8) {
-                deltaKey = m[1];
-                break;
-              }
-            }
-          }
-
-          // check redirect chain destination
-          if (!bypassUrl && !deltaKey && r.url !== link) {
-            const blocked = blockedDomains.some(d => r.url.includes(d));
-            if (!blocked && !isJunk(r.url)) bypassUrl = r.url;
-          }
-
-          // try base64 encoded destinations
-          if (!bypassUrl && !deltaKey) {
-            const b64matches = html.matchAll(/atob\s*\(\s*["']([A-Za-z0-9+/=]{16,})["']\s*\)/g);
-            for (const m of b64matches) {
-              try {
-                const decoded = Buffer.from(m[1], "base64").toString("utf8");
-                if (decoded.startsWith("http") && !isJunk(decoded)) {
-                  const blocked = blockedDomains.some(d => decoded.includes(d));
-                  if (!blocked) { bypassUrl = decoded; break; }
-                }
-              } catch {}
-            }
-          }
-        } catch {}
-
-        // === METHOD 2: bypass APIs (filtered) ===
+        // === METHOD 2: Direct page scrape + redirect follow ===
         if (!bypassUrl && !deltaKey) {
-          const bypassApis = [
-            `https://bypass.bot.nu/bypass2?url=${encodeURIComponent(link)}`,
-            `https://bypass-api.vercel.app/api?url=${encodeURIComponent(link)}`,
+          try {
+            const r = await fetch(link, {
+              redirect: "follow",
+              headers: {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9,tr;q=0.8",
+                "Referer": "https://www.google.com/",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "cross-site",
+              },
+              signal: AbortSignal.timeout(12000),
+            });
+            const html = await r.text();
+
+            // extract destination/target URL from page source
+            const extractPatterns = [
+              /["']destination["']\s*[:=]\s*["'](https?:\/\/[^"']+)["']/i,
+              /["']targetUrl["']\s*[:=]\s*["'](https?:\/\/[^"']+)["']/i,
+              /["']target["']\s*[:=]\s*["'](https?:\/\/[^"']+)["']/i,
+              /data-target\s*=\s*["'](https?:\/\/[^"']+)["']/i,
+              /data-url\s*=\s*["'](https?:\/\/[^"']+)["']/i,
+              /data-href\s*=\s*["'](https?:\/\/[^"']+)["']/i,
+              /window\.location(?:\.href)?\s*=\s*["'](https?:\/\/[^"']+)["']/i,
+              /window\.open\s*\(\s*["'](https?:\/\/[^"']+)["']/i,
+              /redirect(?:Url|_url|URL)\s*[:=]\s*["'](https?:\/\/[^"']+)["']/i,
+              /next(?:Url|_url|URL)\s*[:=]\s*["'](https?:\/\/[^"']+)["']/i,
+              /continue(?:Url|_url|URL)\s*[:=]\s*["'](https?:\/\/[^"']+)["']/i,
+              /(?:final|real|actual)(?:Url|_url|URL|Link|_link)\s*[:=]\s*["'](https?:\/\/[^"']+)["']/i,
+              /href\s*=\s*["'](https?:\/\/gateway\.platoboost[^"']+)["']/i,
+              /["']url["']\s*:\s*["'](https?:\/\/gateway[^"']+)["']/i,
+            ];
+
+            for (const pat of extractPatterns) {
+              const m = html.match(pat);
+              if (m && m[1]) {
+                const candidate = m[1];
+                if (!isBlockedDomain(candidate) && !isJunk(candidate)) {
+                  deltaKey = extractDeltaKey(candidate);
+                  if (!deltaKey) bypassUrl = candidate;
+                  break;
+                }
+              }
+            }
+
+            // try extracting delta key directly from page source
+            if (!bypassUrl && !deltaKey) {
+              const keyPatterns = [
+                /["']?key["']?\s*[:=]\s*["']([A-Za-z0-9_\-]{8,64})["']/,
+                /delta[_\-]?key\s*[:=]\s*["']([^"']{8,64})["']/i,
+                /getKey.*?["']([A-Za-z0-9_\-]{16,64})["']/i,
+                /token\s*[:=]\s*["']([A-Za-z0-9_\-]{16,64})["']/i,
+                /platoboost[^"']*\?[^"']*key=([A-Za-z0-9_\-]{8,64})/i,
+              ];
+              for (const pat of keyPatterns) {
+                const m = html.match(pat);
+                if (m && m[1] && m[1].length >= 8) {
+                  deltaKey = m[1];
+                  break;
+                }
+              }
+            }
+
+            // check redirect chain destination
+            if (!bypassUrl && !deltaKey && r.url !== link) {
+              if (!isBlockedDomain(r.url) && !isJunk(r.url)) {
+                deltaKey = extractDeltaKey(r.url);
+                if (!deltaKey) bypassUrl = r.url;
+              }
+            }
+
+            // try base64 encoded destinations
+            if (!bypassUrl && !deltaKey) {
+              const b64matches = html.matchAll(/atob\s*\(\s*["']([A-Za-z0-9+/=]{16,})["']\s*\)/g);
+              for (const m of b64matches) {
+                try {
+                  const decoded = Buffer.from(m[1], "base64").toString("utf8");
+                  if (decoded.startsWith("http") && !isJunk(decoded) && !isBlockedDomain(decoded)) {
+                    deltaKey = extractDeltaKey(decoded);
+                    if (!deltaKey) bypassUrl = decoded;
+                    break;
+                  }
+                } catch {}
+              }
+            }
+
+            // try JSON embedded in page (some link gates put destination in JSON)
+            if (!bypassUrl && !deltaKey) {
+              const jsonMatches = html.matchAll(/\{[^{}]*"(?:destination|target|url|redirect|next)":\s*"(https?:\/\/[^"]+)"[^{}]*\}/g);
+              for (const m of jsonMatches) {
+                if (m[1] && !isJunk(m[1]) && !isBlockedDomain(m[1])) {
+                  deltaKey = extractDeltaKey(m[1]);
+                  if (!deltaKey) bypassUrl = m[1];
+                  break;
+                }
+              }
+            }
+          } catch {}
+        }
+
+        // === METHOD 3: Free bypass APIs (filtered, multiple fallbacks) ===
+        if (!bypassUrl && !deltaKey) {
+          const freeApis = [
+            { url: `https://bypass.bot.nu/bypass2?url=${encodeURIComponent(link)}`, method: "GET", json: true },
+            { url: `https://bypass-api.vercel.app/api?url=${encodeURIComponent(link)}`, method: "GET", json: true },
+            { url: `https://api.bypass.vip/bypass?url=${encodeURIComponent(link)}`, method: "GET", json: true },
           ];
-          for (const api of bypassApis) {
-            if (bypassUrl) break;
+          for (const api of freeApis) {
+            if (bypassUrl || deltaKey) break;
             try {
-              const r = await fetch(api, {
-                headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" },
+              const r = await fetch(api.url, {
+                method: api.method,
+                headers: {
+                  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                  "Accept": "application/json, text/plain, */*",
+                },
                 signal: AbortSignal.timeout(10000),
               });
               if (r.ok) {
                 const ct = r.headers.get("content-type") || "";
                 let result = null;
-                if (ct.includes("json")) {
-                  const d = await r.json();
-                  result = d.destination || d.result || d.bypassed || d.url || d.target || d.dest || null;
-                  if (typeof result === "object") result = null;
+                if (ct.includes("json") || api.json) {
+                  try {
+                    const d = await r.json();
+                    result = d.destination || d.result || d.bypassed || d.url || d.target
+                           || d.dest || d.direct || d.resolved || d.link || null;
+                    if (typeof result === "object") result = null;
+                  } catch {
+                    const t = await r.text();
+                    if (t.startsWith("http")) result = t.trim().split("\n")[0];
+                  }
                 } else {
                   const t = await r.text();
                   if (t.startsWith("http")) result = t.trim().split("\n")[0];
                 }
-                // FILTER: reject junk/promo responses
-                if (result && !isJunk(result)) bypassUrl = result;
+                if (result && !isJunk(result) && !isBlockedDomain(result)) {
+                  deltaKey = extractDeltaKey(result);
+                  if (!deltaKey) bypassUrl = result;
+                }
               }
             } catch {}
           }
         }
 
-        // === METHOD 3: try following with manual redirect ===
+        // === METHOD 4: Manual redirect chain following (up to 5 hops) ===
         if (!bypassUrl && !deltaKey) {
           try {
-            const r = await fetch(link, {
-              redirect: "manual",
-              headers: {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-              },
-              signal: AbortSignal.timeout(10000),
-            });
-            const loc = r.headers.get("location");
-            if (loc && loc.startsWith("http") && !isJunk(loc)) {
-              const blockedDomains = ["lootlabs", "lootdest", "platorelay", "linkvertise"];
-              const blocked = blockedDomains.some(d => loc.includes(d));
-              if (!blocked) bypassUrl = loc;
-              else {
-                // follow one more redirect
-                try {
-                  const r2 = await fetch(loc, { redirect: "manual", headers: { "User-Agent": "Mozilla/5.0" }, signal: AbortSignal.timeout(8000) });
-                  const loc2 = r2.headers.get("location");
-                  if (loc2 && loc2.startsWith("http") && !isJunk(loc2)) {
-                    const blocked2 = blockedDomains.some(d => loc2.includes(d));
-                    if (!blocked2) bypassUrl = loc2;
-                  }
-                } catch {}
+            let currentUrl = link;
+            for (let hop = 0; hop < 5; hop++) {
+              const r = await fetch(currentUrl, {
+                redirect: "manual",
+                headers: {
+                  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                  "Accept": "text/html,*/*",
+                },
+                signal: AbortSignal.timeout(8000),
+              });
+              const loc = r.headers.get("location");
+              if (!loc || !loc.startsWith("http")) break;
+
+              // check if this redirect lands on the destination
+              if (!isBlockedDomain(loc) && !isJunk(loc)) {
+                deltaKey = extractDeltaKey(loc);
+                if (deltaKey) break;
+                bypassUrl = loc;
+                break;
               }
+              currentUrl = loc;
+            }
+          } catch {}
+        }
+
+        // === METHOD 5: Try fetching the bypass URL itself for another redirect ===
+        if (bypassUrl && !deltaKey) {
+          try {
+            const r = await fetch(bypassUrl, {
+              redirect: "follow",
+              headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" },
+              signal: AbortSignal.timeout(8000),
+            });
+            // check final URL for key
+            if (r.url !== bypassUrl) {
+              const k = extractDeltaKey(r.url);
+              if (k) { deltaKey = k; bypassUrl = null; }
+            }
+            // check page for key
+            if (!deltaKey) {
+              const html = await r.text();
+              const keyMatch = html.match(/platoboost[^"']*\?[^"']*key=([A-Za-z0-9_\-]{8,64})/i)
+                           || html.match(/["']?key["']?\s*[:=]\s*["']([A-Za-z0-9_\-]{8,64})["']/);
+              if (keyMatch && keyMatch[1]) { deltaKey = keyMatch[1]; bypassUrl = null; }
             }
           } catch {}
         }
@@ -1324,31 +1448,39 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
 
         if (deltaKey) {
           await send(chatId,
-            `✅ *Delta Keyiniz:*\n\n🔑 \`${deltaKey}\`\n\n📋 Kopyalamak için dokunun.`,
+            `✅ *Delta Keyiniz:*\n\n🔑 \`${deltaKey}\`\n\n📋 Kopyalamak için uzun basın.`,
             { parse_mode: "Markdown" });
         } else if (bypassUrl) {
           // check if the URL itself contains a key parameter
           try {
             const parsed = new URL(bypassUrl);
-            const possibleKey = parsed.searchParams.get("key") || parsed.searchParams.get("token") || parsed.searchParams.get("code");
-            if (possibleKey && possibleKey.length >= 8) {
+            const possibleKey = extractDeltaKey(bypassUrl);
+            if (possibleKey) {
               await send(chatId,
-                `✅ *Delta Keyiniz:*\n\n🔑 \`${possibleKey}\`\n\n📋 Kopyalamak için dokunun.`,
+                `✅ *Delta Keyiniz:*\n\n🔑 \`${possibleKey}\`\n\n📋 Kopyalamak için uzun basın.`,
                 { parse_mode: "Markdown" });
             } else {
               await send(chatId,
-                `✅ *Bypass Başarılı*\n\n🔗 Delta Keyiniz:\n\`${bypassUrl}\`\n\n📋 Linki aç veya kopyala.`,
+                `✅ *Bypass Başarılı*\n\n🔗 Link:\n\`${bypassUrl}\`\n\n📋 Linki aç, key orada.`,
                 { parse_mode: "Markdown" });
             }
           } catch {
             await send(chatId,
-              `✅ *Bypass Başarılı*\n\n🔗 Delta Keyiniz:\n\`${bypassUrl}\``,
+              `✅ *Bypass Başarılı*\n\n🔗 \`${bypassUrl}\``,
               { parse_mode: "Markdown" });
           }
         } else {
-          await send(chatId,
-            `❌ *Bypass Başarısız*\n\nLink koruması bypass edilemedi. Lootlabs/Linkvertise güncellemiş olabilir.\n\n💡 Tekrar denemek için /menu → Delta Bypass`,
-            { parse_mode: "Markdown" });
+          let failMsg = `❌ *Bypass Başarısız*\n\nBu link bypass edilemedi.`;
+          if (linkType === "lootlabs") {
+            failMsg += `\n\n💡 Lootlabs linkleri çoğu zaman görev tamamlamadan açılmaz. Görevleri tamamlayıp tekrar dene.`;
+          } else if (linkType === "linkvertise") {
+            failMsg += `\n\n💡 Linkvertise korumayı güncellemiş olabilir. Biraz sonra tekrar dene.`;
+          }
+          if (!BYPASS_API_KEY) {
+            failMsg += `\n\n🔧 _Owner: Daha güvenilir bypass için BYPASS\\_API\\_KEY env değişkenine bypass-links.com API keyini ekle._`;
+          }
+          failMsg += `\n\n🔄 Tekrar denemek için /menu → Delta Bypass`;
+          await send(chatId, failMsg, { parse_mode: "Markdown" });
         }
         return;
       }
