@@ -436,7 +436,7 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
     if (data === "delta_bypass_prompt") {
       pending[chatId] = { step: "delta_bypass" };
       logActivity(chatId, tgUser, "DELTA_BYPASS_START");
-      await editMsg(chatId, msgId, "🔓 *Delta Bypass*\n\nDelta/Linkvertise linkini yapıştır:", { parse_mode: "Markdown" });
+      await editMsg(chatId, msgId, "🔓 *Delta Bypass*\n\nLinkvertise veya Lootlabs linkini yapıştır:", { parse_mode: "Markdown" });
       return;
     }
 
@@ -905,54 +905,132 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
         delete pending[chatId];
         const link = text.trim();
 
-        // extract linkvertise ID from URL
         let bypassUrl = null;
+        let linkType = null;
+
         try {
           const u = new URL(link);
-          const host = u.hostname.replace("www.", "");
-          if (host.includes("linkvertise") || host.includes("link-to") || host.includes("direct-link") || host.includes("link-center") || host.includes("link-hub")) {
-            // method 1: bypass API
-            const bypassApis = [
-              `https://bypass.bot.nu/bypass2?url=${encodeURIComponent(link)}`,
-              `https://api.bypass.vip/bypass?url=${encodeURIComponent(link)}`,
-            ];
-            for (const api of bypassApis) {
-              try {
-                const r = await fetch(api, { headers: { "User-Agent": "Mozilla/5.0" }, signal: AbortSignal.timeout(8000) });
-                if (r.ok) {
-                  const d = await r.json();
-                  if (d.destination || d.result || d.bypassed) {
-                    bypassUrl = d.destination || d.result || d.bypassed;
-                    break;
-                  }
-                }
-              } catch {}
-            }
+          const host = u.hostname.replace("www.", "").toLowerCase();
 
-            // method 2: direct resolve
-            if (!bypassUrl) {
-              try {
-                const r2 = await fetch(link, { redirect: "follow", headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" }, signal: AbortSignal.timeout(8000) });
-                if (r2.url && r2.url !== link) bypassUrl = r2.url;
-              } catch {}
-            }
+          // detect link type
+          if (host.includes("linkvertise") || host.includes("link-to") || host.includes("direct-link") || host.includes("link-center") || host.includes("link-hub")) {
+            linkType = "linkvertise";
+          } else if (host.includes("lootlabs") || host.includes("lootlab") || host.includes("loot-link") || host.includes("lootdest")) {
+            linkType = "lootlabs";
           } else {
-            await send(chatId, "❌ Geçerli bir Linkvertise/Delta linki değil.");
-            return;
+            // try anyway — might be a redirect domain
+            linkType = "unknown";
           }
         } catch {
           await send(chatId, "❌ Geçersiz URL. Tam linki yapıştır.");
           return;
         }
 
-        logActivity(chatId, tgUser, "DELTA_BYPASS", bypassUrl ? "OK" : "FAIL");
+        await send(chatId, "⏳ Bypass deneniyor...");
+
+        // method 1: bypass APIs (support both linkvertise + lootlabs)
+        const bypassApis = [
+          `https://bypass.bot.nu/bypass2?url=${encodeURIComponent(link)}`,
+          `https://api.bypass.vip/bypass?url=${encodeURIComponent(link)}`,
+          `https://bypass-api.vercel.app/api?url=${encodeURIComponent(link)}`,
+          `https://bypass.pm/bypass2?url=${encodeURIComponent(link)}`,
+        ];
+
+        for (const api of bypassApis) {
+          if (bypassUrl) break;
+          try {
+            const r = await fetch(api, {
+              headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" },
+              signal: AbortSignal.timeout(10000),
+            });
+            if (r.ok) {
+              const ct = r.headers.get("content-type") || "";
+              if (ct.includes("json")) {
+                const d = await r.json();
+                bypassUrl = d.destination || d.result || d.bypassed || d.url || d.target || d.dest || null;
+                if (typeof bypassUrl === "object") bypassUrl = null;
+              } else {
+                const t = await r.text();
+                // some APIs return plain URL
+                if (t.startsWith("http")) bypassUrl = t.trim();
+              }
+            }
+          } catch {}
+        }
+
+        // method 2: lootlabs specific — try extracting from page source
+        if (!bypassUrl && (linkType === "lootlabs" || linkType === "unknown")) {
+          try {
+            const r = await fetch(link, {
+              redirect: "follow",
+              headers: {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml",
+              },
+              signal: AbortSignal.timeout(10000),
+            });
+            const html = await r.text();
+            // extract destination from page
+            const patterns = [
+              /destination["']?\s*[:=]\s*["'](https?:\/\/[^"']+)["']/i,
+              /target["']?\s*[:=]\s*["'](https?:\/\/[^"']+)["']/i,
+              /url["']?\s*[:=]\s*["'](https?:\/\/[^"']+)["']/i,
+              /window\.location\s*=\s*["'](https?:\/\/[^"']+)["']/i,
+              /href\s*=\s*["'](https?:\/\/(?!lootlabs|lootdest|loot-link)[^"']+)["']/i,
+            ];
+            for (const pat of patterns) {
+              const m = html.match(pat);
+              if (m && m[1] && !m[1].includes("lootlabs") && !m[1].includes("lootdest")) {
+                bypassUrl = m[1];
+                break;
+              }
+            }
+            // check final URL after redirects
+            if (!bypassUrl && r.url !== link && !r.url.includes("lootlabs") && !r.url.includes("lootdest")) {
+              bypassUrl = r.url;
+            }
+          } catch {}
+        }
+
+        // method 3: linkvertise specific — try direct follow
+        if (!bypassUrl && (linkType === "linkvertise" || linkType === "unknown")) {
+          try {
+            const r = await fetch(link, {
+              redirect: "follow",
+              headers: {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+              },
+              signal: AbortSignal.timeout(10000),
+            });
+            const html = await r.text();
+            const patterns = [
+              /destination["']?\s*[:=]\s*["'](https?:\/\/[^"']+)["']/i,
+              /target["']?\s*[:=]\s*["'](https?:\/\/[^"']+)["']/i,
+              /linkvertise\.com\/\d+\/[^"']*\?r=(https?[^"'&]+)/i,
+            ];
+            for (const pat of patterns) {
+              const m = html.match(pat);
+              if (m && m[1]) {
+                bypassUrl = decodeURIComponent(m[1]);
+                break;
+              }
+            }
+            if (!bypassUrl && r.url !== link && !r.url.includes("linkvertise")) {
+              bypassUrl = r.url;
+            }
+          } catch {}
+        }
+
+        logActivity(chatId, tgUser, "DELTA_BYPASS", `${linkType} | ${bypassUrl ? "OK" : "FAIL"}`);
 
         if (bypassUrl) {
           await send(chatId,
-            `✅ *Bypass Başarılı*\n\n🔗 [Sonuç Linki](${bypassUrl})\n\n\`${bypassUrl}\``,
+            `✅ *Bypass Başarılı*\n\n📎 Tip: ${linkType}\n🔗 [Sonuç Linki](${bypassUrl})\n\n\`${bypassUrl}\``,
             { parse_mode: "Markdown" });
         } else {
-          await send(chatId, "❌ Bypass yapılamadı. Link geçersiz veya API yanıt vermedi.\n\nFarklı bir link dene veya manuel tamamla.");
+          await send(chatId,
+            `❌ *Bypass Başarısız*\n\n📎 Tip: ${linkType}\n\nTüm yöntemler denendi. Link koruması güncellenmiş olabilir.\n\n💡 Tekrar denemek için /menu → Delta Bypass`,
+            { parse_mode: "Markdown" });
         }
         return;
       }
