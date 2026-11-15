@@ -75,17 +75,54 @@ const ADMIN_ID = process.env.ADMIN_ID || "8961529079";
 const PORT = process.env.PORT || 3000;
 const API = `https://api.telegram.org/bot${BOT_TOKEN}`;
 
-// ─── IN-MEMORY STATE ────────────────────────────────────────
-// users: chatId -> { username, password, rank, createdAt, createdBy }
-// OWNER auto-seeded on first /start from ADMIN_ID
+// ─── PERSISTENT STATE ───────────────────────────────────────
+const fs = require("fs");
+const DATA_FILE = "/tmp/nexus_data.json";
+
 let users = {};
 let keys = {};
-let sessions = {};       // chatId -> { authed, rank, lastActivity, loginAttempts, lockedUntil }
+let sessions = {};
 let activityLog = [];
 let maintenance = false;
 let announcement = "";
 let bannedUsers = {};
 let securityAlerts = [];
+
+// Load state from disk on startup
+function loadState() {
+  try {
+    if (fs.existsSync(DATA_FILE)) {
+      const raw = fs.readFileSync(DATA_FILE, "utf8");
+      const d = JSON.parse(raw);
+      users = d.users || {};
+      keys = d.keys || {};
+      bannedUsers = d.bannedUsers || {};
+      maintenance = d.maintenance || false;
+      announcement = d.announcement || "";
+      activityLog = d.activityLog || [];
+      securityAlerts = d.securityAlerts || [];
+      console.log(`[DATA] Yüklendi: ${Object.keys(users).length} kullanıcı, ${Object.keys(keys).length} key`);
+    }
+  } catch (e) { console.error("[DATA] Yükleme hatası:", e.message); }
+}
+
+// Save state to disk
+function saveState() {
+  try {
+    const d = JSON.stringify({ users, keys, bannedUsers, maintenance, announcement, activityLog, securityAlerts, savedAt: new Date().toISOString() });
+    fs.writeFileSync(DATA_FILE, d, "utf8");
+  } catch (e) { console.error("[DATA] Kayıt hatası:", e.message); }
+}
+
+// Auto-save every 30 seconds
+setInterval(saveState, 30000);
+
+// Save on shutdown
+process.on("SIGTERM", () => { saveState(); console.log("[DATA] SIGTERM — kaydedildi"); process.exit(0); });
+process.on("SIGINT", () => { saveState(); console.log("[DATA] SIGINT — kaydedildi"); process.exit(0); });
+
+// Load on boot
+loadState();
 
 // ─── SEED OWNER ─────────────────────────────────────────────
 // Owner is auto-registered when they first /start the bot
@@ -870,6 +907,40 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
     }
     touchSession(session);
 
+    // /backup — owner only: sends all data as JSON message
+    if (text === "/backup" && String(chatId) === String(ADMIN_ID)) {
+      saveState();
+      const backup = JSON.stringify({ users, keys, bannedUsers, maintenance, announcement }, null, 2);
+      // split into chunks if too long (Telegram 4096 char limit)
+      const chunks = [];
+      for (let i = 0; i < backup.length; i += 3900) chunks.push(backup.slice(i, i + 3900));
+      await send(chatId, `💾 *BACKUP* — ${Object.keys(users).length} kullanıcı, ${Object.keys(keys).length} key\n\nAşağıdaki JSON'ı kaydet. Geri yüklemek için:\n\`/restore <JSON>\``, { parse_mode: "Markdown" });
+      for (const chunk of chunks) {
+        await send(chatId, `\`\`\`\n${chunk}\n\`\`\``, { parse_mode: "Markdown" });
+      }
+      logActivity(chatId, tgUser, "BACKUP");
+      return;
+    }
+
+    // /restore — owner only: loads data from JSON
+    if (text.startsWith("/restore ") && String(chatId) === String(ADMIN_ID)) {
+      try {
+        const json = text.slice(9).trim();
+        const d = JSON.parse(json);
+        if (d.users) users = { ...users, ...d.users };
+        if (d.keys) keys = { ...keys, ...d.keys };
+        if (d.bannedUsers) bannedUsers = { ...bannedUsers, ...d.bannedUsers };
+        if (d.maintenance !== undefined) maintenance = d.maintenance;
+        if (d.announcement !== undefined) announcement = d.announcement;
+        saveState();
+        logActivity(chatId, tgUser, "RESTORE", `${Object.keys(d.users || {}).length} kullanıcı`);
+        await send(chatId, `✅ *Geri yüklendi!*\n\n👤 Kullanıcı: ${Object.keys(users).length}\n🔑 Key: ${Object.keys(keys).length}`, { parse_mode: "Markdown" });
+      } catch (e) {
+        await send(chatId, `❌ JSON parse hatası: ${e.message}`);
+      }
+      return;
+    }
+
     // /menu
     if (text === "/menu") {
       const u = users[chatId];
@@ -907,18 +978,31 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
 
         let bypassUrl = null;
         let linkType = null;
+        let deltaKey = null;
 
+        // junk filter — reject fake/promo responses
+        const junkPatterns = [
+          /discord\.gg/i, /discord\.com/i, /join here/i, /shut down/i,
+          /leechers/i, /patreon/i, /donate/i, /premium/i, /subscribe/i,
+          /t\.me\//i, /telegram/i,
+        ];
+        function isJunk(str) {
+          if (!str || typeof str !== "string") return true;
+          if (str.length > 500) return true;
+          if (!str.startsWith("http")) return true;
+          for (const p of junkPatterns) { if (p.test(str)) return true; }
+          return false;
+        }
+
+        // detect link type
         try {
           const u = new URL(link);
           const host = u.hostname.replace("www.", "").toLowerCase();
-
-          // detect link type
           if (host.includes("linkvertise") || host.includes("link-to") || host.includes("direct-link") || host.includes("link-center") || host.includes("link-hub")) {
             linkType = "linkvertise";
-          } else if (host.includes("lootlabs") || host.includes("lootlab") || host.includes("loot-link") || host.includes("lootdest")) {
+          } else if (host.includes("lootlabs") || host.includes("lootlab") || host.includes("loot-link") || host.includes("lootdest") || host.includes("platorelay")) {
             linkType = "lootlabs";
           } else {
-            // try anyway — might be a redirect domain
             linkType = "unknown";
           }
         } catch {
@@ -928,108 +1012,177 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
 
         await send(chatId, "⏳ Bypass deneniyor...");
 
-        // method 1: bypass APIs (support both linkvertise + lootlabs)
-        const bypassApis = [
-          `https://bypass.bot.nu/bypass2?url=${encodeURIComponent(link)}`,
-          `https://api.bypass.vip/bypass?url=${encodeURIComponent(link)}`,
-          `https://bypass-api.vercel.app/api?url=${encodeURIComponent(link)}`,
-          `https://bypass.pm/bypass2?url=${encodeURIComponent(link)}`,
-        ];
+        // === METHOD 1: direct page scrape + redirect follow ===
+        try {
+          const r = await fetch(link, {
+            redirect: "follow",
+            headers: {
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+              "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+              "Accept-Language": "en-US,en;q=0.9",
+              "Referer": "https://www.google.com/",
+            },
+            signal: AbortSignal.timeout(12000),
+          });
+          const html = await r.text();
 
-        for (const api of bypassApis) {
-          if (bypassUrl) break;
-          try {
-            const r = await fetch(api, {
-              headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" },
-              signal: AbortSignal.timeout(10000),
-            });
-            if (r.ok) {
-              const ct = r.headers.get("content-type") || "";
-              if (ct.includes("json")) {
-                const d = await r.json();
-                bypassUrl = d.destination || d.result || d.bypassed || d.url || d.target || d.dest || null;
-                if (typeof bypassUrl === "object") bypassUrl = null;
-              } else {
-                const t = await r.text();
-                // some APIs return plain URL
-                if (t.startsWith("http")) bypassUrl = t.trim();
-              }
-            }
-          } catch {}
-        }
+          // extract destination/target URL from page source
+          const extractPatterns = [
+            /["']destination["']\s*[:=]\s*["'](https?:\/\/[^"']+)["']/i,
+            /["']targetUrl["']\s*[:=]\s*["'](https?:\/\/[^"']+)["']/i,
+            /["']target["']\s*[:=]\s*["'](https?:\/\/[^"']+)["']/i,
+            /data-target\s*=\s*["'](https?:\/\/[^"']+)["']/i,
+            /data-url\s*=\s*["'](https?:\/\/[^"']+)["']/i,
+            /data-href\s*=\s*["'](https?:\/\/[^"']+)["']/i,
+            /window\.location(?:\.href)?\s*=\s*["'](https?:\/\/[^"']+)["']/i,
+            /window\.open\s*\(\s*["'](https?:\/\/[^"']+)["']/i,
+            /redirect(?:Url|_url|URL)\s*[:=]\s*["'](https?:\/\/[^"']+)["']/i,
+            /next(?:Url|_url|URL)\s*[:=]\s*["'](https?:\/\/[^"']+)["']/i,
+            /continue(?:Url|_url|URL)\s*[:=]\s*["'](https?:\/\/[^"']+)["']/i,
+            /(?:final|real|actual)(?:Url|_url|URL|Link|_link)\s*[:=]\s*["'](https?:\/\/[^"']+)["']/i,
+          ];
 
-        // method 2: lootlabs specific — try extracting from page source
-        if (!bypassUrl && (linkType === "lootlabs" || linkType === "unknown")) {
-          try {
-            const r = await fetch(link, {
-              redirect: "follow",
-              headers: {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml",
-              },
-              signal: AbortSignal.timeout(10000),
-            });
-            const html = await r.text();
-            // extract destination from page
-            const patterns = [
-              /destination["']?\s*[:=]\s*["'](https?:\/\/[^"']+)["']/i,
-              /target["']?\s*[:=]\s*["'](https?:\/\/[^"']+)["']/i,
-              /url["']?\s*[:=]\s*["'](https?:\/\/[^"']+)["']/i,
-              /window\.location\s*=\s*["'](https?:\/\/[^"']+)["']/i,
-              /href\s*=\s*["'](https?:\/\/(?!lootlabs|lootdest|loot-link)[^"']+)["']/i,
-            ];
-            for (const pat of patterns) {
-              const m = html.match(pat);
-              if (m && m[1] && !m[1].includes("lootlabs") && !m[1].includes("lootdest")) {
-                bypassUrl = m[1];
+          const blockedDomains = ["lootlabs", "lootdest", "loot-link", "platorelay", "linkvertise", "link-to", "direct-link", "link-center", "link-hub", "google.com", "facebook.com", "twitter.com"];
+
+          for (const pat of extractPatterns) {
+            const m = html.match(pat);
+            if (m && m[1]) {
+              const candidate = m[1];
+              const blocked = blockedDomains.some(d => candidate.includes(d));
+              if (!blocked && !isJunk(candidate)) {
+                bypassUrl = candidate;
                 break;
               }
             }
-            // check final URL after redirects
-            if (!bypassUrl && r.url !== link && !r.url.includes("lootlabs") && !r.url.includes("lootdest")) {
-              bypassUrl = r.url;
-            }
-          } catch {}
-        }
+          }
 
-        // method 3: linkvertise specific — try direct follow
-        if (!bypassUrl && (linkType === "linkvertise" || linkType === "unknown")) {
-          try {
-            const r = await fetch(link, {
-              redirect: "follow",
-              headers: {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-              },
-              signal: AbortSignal.timeout(10000),
-            });
-            const html = await r.text();
-            const patterns = [
-              /destination["']?\s*[:=]\s*["'](https?:\/\/[^"']+)["']/i,
-              /target["']?\s*[:=]\s*["'](https?:\/\/[^"']+)["']/i,
-              /linkvertise\.com\/\d+\/[^"']*\?r=(https?[^"'&]+)/i,
+          // try extracting delta key directly from page
+          if (!bypassUrl) {
+            const keyPatterns = [
+              /["']?key["']?\s*[:=]\s*["']([A-Za-z0-9_\-]{8,})["']/,
+              /delta[_\-]?key\s*[:=]\s*["']([^"']+)["']/i,
+              /getKey.*?["']([A-Za-z0-9_\-]{16,})["']/i,
+              /token\s*[:=]\s*["']([A-Za-z0-9_\-]{16,})["']/i,
             ];
-            for (const pat of patterns) {
+            for (const pat of keyPatterns) {
               const m = html.match(pat);
-              if (m && m[1]) {
-                bypassUrl = decodeURIComponent(m[1]);
+              if (m && m[1] && m[1].length >= 8) {
+                deltaKey = m[1];
                 break;
               }
             }
-            if (!bypassUrl && r.url !== link && !r.url.includes("linkvertise")) {
-              bypassUrl = r.url;
+          }
+
+          // check redirect chain destination
+          if (!bypassUrl && !deltaKey && r.url !== link) {
+            const blocked = blockedDomains.some(d => r.url.includes(d));
+            if (!blocked && !isJunk(r.url)) bypassUrl = r.url;
+          }
+
+          // try base64 encoded destinations
+          if (!bypassUrl && !deltaKey) {
+            const b64matches = html.matchAll(/atob\s*\(\s*["']([A-Za-z0-9+/=]{16,})["']\s*\)/g);
+            for (const m of b64matches) {
+              try {
+                const decoded = Buffer.from(m[1], "base64").toString("utf8");
+                if (decoded.startsWith("http") && !isJunk(decoded)) {
+                  const blocked = blockedDomains.some(d => decoded.includes(d));
+                  if (!blocked) { bypassUrl = decoded; break; }
+                }
+              } catch {}
+            }
+          }
+        } catch {}
+
+        // === METHOD 2: bypass APIs (filtered) ===
+        if (!bypassUrl && !deltaKey) {
+          const bypassApis = [
+            `https://bypass.bot.nu/bypass2?url=${encodeURIComponent(link)}`,
+            `https://bypass-api.vercel.app/api?url=${encodeURIComponent(link)}`,
+          ];
+          for (const api of bypassApis) {
+            if (bypassUrl) break;
+            try {
+              const r = await fetch(api, {
+                headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" },
+                signal: AbortSignal.timeout(10000),
+              });
+              if (r.ok) {
+                const ct = r.headers.get("content-type") || "";
+                let result = null;
+                if (ct.includes("json")) {
+                  const d = await r.json();
+                  result = d.destination || d.result || d.bypassed || d.url || d.target || d.dest || null;
+                  if (typeof result === "object") result = null;
+                } else {
+                  const t = await r.text();
+                  if (t.startsWith("http")) result = t.trim().split("\n")[0];
+                }
+                // FILTER: reject junk/promo responses
+                if (result && !isJunk(result)) bypassUrl = result;
+              }
+            } catch {}
+          }
+        }
+
+        // === METHOD 3: try following with manual redirect ===
+        if (!bypassUrl && !deltaKey) {
+          try {
+            const r = await fetch(link, {
+              redirect: "manual",
+              headers: {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+              },
+              signal: AbortSignal.timeout(10000),
+            });
+            const loc = r.headers.get("location");
+            if (loc && loc.startsWith("http") && !isJunk(loc)) {
+              const blockedDomains = ["lootlabs", "lootdest", "platorelay", "linkvertise"];
+              const blocked = blockedDomains.some(d => loc.includes(d));
+              if (!blocked) bypassUrl = loc;
+              else {
+                // follow one more redirect
+                try {
+                  const r2 = await fetch(loc, { redirect: "manual", headers: { "User-Agent": "Mozilla/5.0" }, signal: AbortSignal.timeout(8000) });
+                  const loc2 = r2.headers.get("location");
+                  if (loc2 && loc2.startsWith("http") && !isJunk(loc2)) {
+                    const blocked2 = blockedDomains.some(d => loc2.includes(d));
+                    if (!blocked2) bypassUrl = loc2;
+                  }
+                } catch {}
+              }
             }
           } catch {}
         }
 
-        logActivity(chatId, tgUser, "DELTA_BYPASS", `${linkType} | ${bypassUrl ? "OK" : "FAIL"}`);
+        logActivity(chatId, tgUser, "DELTA_BYPASS", `${linkType} | ${deltaKey ? "KEY" : bypassUrl ? "URL" : "FAIL"}`);
 
-        if (bypassUrl) {
+        if (deltaKey) {
           await send(chatId,
-            `✅ *Bypass Başarılı*\n\n📎 Tip: ${linkType}\n🔗 [Sonuç Linki](${bypassUrl})\n\n\`${bypassUrl}\``,
+            `✅ *Delta Keyiniz:*\n\n🔑 \`${deltaKey}\`\n\n📋 Kopyalamak için dokunun.`,
             { parse_mode: "Markdown" });
+        } else if (bypassUrl) {
+          // check if the URL itself contains a key parameter
+          try {
+            const parsed = new URL(bypassUrl);
+            const possibleKey = parsed.searchParams.get("key") || parsed.searchParams.get("token") || parsed.searchParams.get("code");
+            if (possibleKey && possibleKey.length >= 8) {
+              await send(chatId,
+                `✅ *Delta Keyiniz:*\n\n🔑 \`${possibleKey}\`\n\n📋 Kopyalamak için dokunun.`,
+                { parse_mode: "Markdown" });
+            } else {
+              await send(chatId,
+                `✅ *Bypass Başarılı*\n\n🔗 Delta Keyiniz:\n\`${bypassUrl}\`\n\n📋 Linki aç veya kopyala.`,
+                { parse_mode: "Markdown" });
+            }
+          } catch {
+            await send(chatId,
+              `✅ *Bypass Başarılı*\n\n🔗 Delta Keyiniz:\n\`${bypassUrl}\``,
+              { parse_mode: "Markdown" });
+          }
         } else {
           await send(chatId,
-            `❌ *Bypass Başarısız*\n\n📎 Tip: ${linkType}\n\nTüm yöntemler denendi. Link koruması güncellenmiş olabilir.\n\n💡 Tekrar denemek için /menu → Delta Bypass`,
+            `❌ *Bypass Başarısız*\n\nLink koruması bypass edilemedi. Lootlabs/Linkvertise güncellemiş olabilir.\n\n💡 Tekrar denemek için /menu → Delta Bypass`,
             { parse_mode: "Markdown" });
         }
         return;
@@ -1187,6 +1340,27 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
       return;
     }
   }
+});
+
+// ─── BACKUP API (owner secret) ─────────────────────────────
+const BACKUP_SECRET = process.env.BACKUP_SECRET || BOT_TOKEN;
+
+app.get("/backup", (req, res) => {
+  if (req.query.secret !== BACKUP_SECRET) return res.status(403).json({ error: "yetkisiz" });
+  saveState();
+  res.json({ users, keys, bannedUsers, maintenance, announcement, savedAt: new Date().toISOString() });
+});
+
+app.post("/restore", express.json(), (req, res) => {
+  if (req.query.secret !== BACKUP_SECRET) return res.status(403).json({ error: "yetkisiz" });
+  const d = req.body;
+  if (d.users) users = { ...users, ...d.users };
+  if (d.keys) keys = { ...keys, ...d.keys };
+  if (d.bannedUsers) bannedUsers = { ...bannedUsers, ...d.bannedUsers };
+  if (d.maintenance !== undefined) maintenance = d.maintenance;
+  if (d.announcement !== undefined) announcement = d.announcement;
+  saveState();
+  res.json({ status: "ok", users: Object.keys(users).length, keys: Object.keys(keys).length });
 });
 
 // ─── API (rate limited) ─────────────────────────────────────
