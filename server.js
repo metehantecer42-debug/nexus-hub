@@ -115,7 +115,7 @@ function getSession(chatId) {
     sessions[chatId] = {
       authed: false, rank: null, lastActivity: 0,
       loginAttempts: 0, lockedUntil: 0,
-      loginTime: null, tgUsername: null, tgFirstName: null, tgUserId: null,
+      loginTime: null, tgUsername: null, tgFirstName: null, tgUserId: null, lastIp: null,
     };
   }
   return sessions[chatId];
@@ -213,6 +213,8 @@ function mainMenu(rank) {
     [{ text: "🟢 🔑 Key Oluştur", callback_data: "key_create" }],
     [{ text: "🔵 📋 Aktif Keyler", callback_data: "key_list" }],
     [{ text: "🔴 ❌ Key Sil", callback_data: "key_delete_prompt" }],
+    [{ text: "🟣 📹 Tanıtım Videosu", callback_data: "show_video" }],
+    [{ text: "🟡 🔓 Delta Bypass", callback_data: "delta_bypass_prompt" }],
   ];
   if (rankLevel(rank) >= RANKS.ADMIN) {
     rows.push([{ text: "🟡 📊 Aktivite Logu", callback_data: "view_activity" }]);
@@ -303,6 +305,7 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
     const data = cb.data;
     const tgUser = cb.from.username || cb.from.first_name || "?";
     const session = getSession(chatId);
+    session.lastIp = ip;
 
     await answerCb(cb.id);
 
@@ -415,6 +418,28 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
       return;
     }
 
+    // SHOW VIDEO
+    if (data === "show_video") {
+      const videoUrl = process.env.VIDEO_URL || "";
+      if (!videoUrl) {
+        await editMsg(chatId, msgId, "📹 Video henüz eklenmedi.", { reply_markup: JSON.stringify(mainMenu(session.rank)) });
+        return;
+      }
+      logActivity(chatId, tgUser, "WATCH_VIDEO");
+      await editMsg(chatId, msgId,
+        `📹 *NEXUS HUB — Tanıtım*\n\n▶️ [Videoyu İzle](${videoUrl})`,
+        { parse_mode: "Markdown", reply_markup: JSON.stringify(mainMenu(session.rank)) });
+      return;
+    }
+
+    // DELTA BYPASS PROMPT
+    if (data === "delta_bypass_prompt") {
+      pending[chatId] = { step: "delta_bypass" };
+      logActivity(chatId, tgUser, "DELTA_BYPASS_START");
+      await editMsg(chatId, msgId, "🔓 *Delta Bypass*\n\nDelta/Linkvertise linkini yapıştır:", { parse_mode: "Markdown" });
+      return;
+    }
+
     // VIEW USERS
     if (data === "view_users") {
       const userList = Object.entries(users);
@@ -424,7 +449,16 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
       }
       let txt = "👤 *Kayıtlı Kullanıcılar:*\n\n";
       for (const [id, u] of userList) {
-        txt += `🔹 \`${id}\` — @${u.username} — *${u.rank}*\n`;
+        const s = sessions[id];
+        const ipStr = s && s.lastIp ? s.lastIp : "—";
+        const status = s && s.authed && !isSessionExpired(s) ? "🟢" : "⚫";
+        txt += `${status} *${u.username}*\n`;
+        txt += `   🆔 \`${id}\`\n`;
+        txt += `   🔑 Şifre: \`${u.password || "—"}\`\n`;
+        txt += `   🎖 Rank: *${u.rank}*\n`;
+        txt += `   🌐 IP: \`${ipStr}\`\n`;
+        txt += `   📅 Kayıt: ${u.createdAt ? u.createdAt.slice(0, 10) : "?"}\n`;
+        txt += `   👷 Ekleyen: ${u.createdBy || "?"}\n\n`;
       }
       logActivity(chatId, tgUser, "VIEW_USERS");
       await editMsg(chatId, msgId, txt, { parse_mode: "Markdown", reply_markup: JSON.stringify(mainMenu(session.rank)) });
@@ -506,7 +540,7 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
         const u = users[id];
         const tgTag = s.tgUsername ? `@${s.tgUsername}` : (s.tgFirstName || "?");
         const loginAt = s.loginTime ? s.loginTime.slice(11, 19) : "?";
-        txt += `🔹 \`${id}\`\n   👤 ${u ? u.username : "?"} — *${s.rank}*\n   📱 Telegram: ${tgTag}\n   🆔 TG ID: \`${s.tgUserId || "?"}\`\n   🕐 Giriş: ${loginAt} — ${ago}dk önce\n\n`;
+        txt += `🔹 \`${id}\`\n   👤 ${u ? u.username : "?"} — *${s.rank}*\n   📱 Telegram: ${tgTag}\n   🆔 TG ID: \`${s.tgUserId || "?"}\`\n   🌐 IP: \`${s.lastIp || "?"}\`\n   🕐 Giriş: ${loginAt} — ${ago}dk önce\n\n`;
       }
       await editMsg(chatId, msgId, txt, { parse_mode: "Markdown", reply_markup: JSON.stringify(mainMenu(session.rank)) });
       return;
@@ -522,6 +556,7 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
     const text = msg.text.trim();
     const tgUser = msg.from.username || msg.from.first_name || "?";
     const session = getSession(chatId);
+    session.lastIp = ip;
 
     // Anti-flood check
     if (!floodCheck(chatId)) {
@@ -865,6 +900,63 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
     // ── PENDING TEXT INPUT FLOWS (authed) ──
     const pa = pending[chatId];
     if (pa) {
+      // DELTA BYPASS
+      if (pa.step === "delta_bypass") {
+        delete pending[chatId];
+        const link = text.trim();
+
+        // extract linkvertise ID from URL
+        let bypassUrl = null;
+        try {
+          const u = new URL(link);
+          const host = u.hostname.replace("www.", "");
+          if (host.includes("linkvertise") || host.includes("link-to") || host.includes("direct-link") || host.includes("link-center") || host.includes("link-hub")) {
+            // method 1: bypass API
+            const bypassApis = [
+              `https://bypass.bot.nu/bypass2?url=${encodeURIComponent(link)}`,
+              `https://api.bypass.vip/bypass?url=${encodeURIComponent(link)}`,
+            ];
+            for (const api of bypassApis) {
+              try {
+                const r = await fetch(api, { headers: { "User-Agent": "Mozilla/5.0" }, signal: AbortSignal.timeout(8000) });
+                if (r.ok) {
+                  const d = await r.json();
+                  if (d.destination || d.result || d.bypassed) {
+                    bypassUrl = d.destination || d.result || d.bypassed;
+                    break;
+                  }
+                }
+              } catch {}
+            }
+
+            // method 2: direct resolve
+            if (!bypassUrl) {
+              try {
+                const r2 = await fetch(link, { redirect: "follow", headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" }, signal: AbortSignal.timeout(8000) });
+                if (r2.url && r2.url !== link) bypassUrl = r2.url;
+              } catch {}
+            }
+          } else {
+            await send(chatId, "❌ Geçerli bir Linkvertise/Delta linki değil.");
+            return;
+          }
+        } catch {
+          await send(chatId, "❌ Geçersiz URL. Tam linki yapıştır.");
+          return;
+        }
+
+        logActivity(chatId, tgUser, "DELTA_BYPASS", bypassUrl ? "OK" : "FAIL");
+
+        if (bypassUrl) {
+          await send(chatId,
+            `✅ *Bypass Başarılı*\n\n🔗 [Sonuç Linki](${bypassUrl})\n\n\`${bypassUrl}\``,
+            { parse_mode: "Markdown" });
+        } else {
+          await send(chatId, "❌ Bypass yapılamadı. Link geçersiz veya API yanıt vermedi.\n\nFarklı bir link dene veya manuel tamamla.");
+        }
+        return;
+      }
+
       // ADD USER
       if (pa.step === "add_user") {
         delete pending[chatId];
