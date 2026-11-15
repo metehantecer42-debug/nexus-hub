@@ -115,6 +115,7 @@ function getSession(chatId) {
     sessions[chatId] = {
       authed: false, rank: null, lastActivity: 0,
       loginAttempts: 0, lockedUntil: 0,
+      loginTime: null, tgUsername: null, tgFirstName: null, tgUserId: null,
     };
   }
   return sessions[chatId];
@@ -503,7 +504,9 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
       for (const [id, s] of active) {
         const ago = Math.floor((Date.now() - s.lastActivity) / 60000);
         const u = users[id];
-        txt += `🔹 \`${id}\` @${u ? u.username : "?"} — *${s.rank}* — ${ago}dk\n`;
+        const tgTag = s.tgUsername ? `@${s.tgUsername}` : (s.tgFirstName || "?");
+        const loginAt = s.loginTime ? s.loginTime.slice(11, 19) : "?";
+        txt += `🔹 \`${id}\`\n   👤 ${u ? u.username : "?"} — *${s.rank}*\n   📱 Telegram: ${tgTag}\n   🆔 TG ID: \`${s.tgUserId || "?"}\`\n   🕐 Giriş: ${loginAt} — ${ago}dk önce\n\n`;
       }
       await editMsg(chatId, msgId, txt, { parse_mode: "Markdown", reply_markup: JSON.stringify(mainMenu(session.rank)) });
       return;
@@ -547,6 +550,10 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
         session.rank = "OWNER";
         session.loginAttempts = 0;
         session.lockedUntil = 0;
+        session.loginTime = new Date().toISOString();
+        session.tgUsername = msg.from.username || null;
+        session.tgFirstName = msg.from.first_name || null;
+        session.tgUserId = msg.from.id;
         touchSession(session);
         logActivity(chatId, tgUser, "LOGIN_OWNER");
         await send(chatId,
@@ -597,6 +604,10 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
         session.rank = "OWNER";
         session.loginAttempts = 0;
         session.lockedUntil = 0;
+        session.loginTime = new Date().toISOString();
+        session.tgUsername = msg.from.username || null;
+        session.tgFirstName = msg.from.first_name || null;
+        session.tgUserId = msg.from.id;
         touchSession(session);
         logActivity(chatId, tgUser, "LOGIN_OWNER");
         await send(chatId, `👑 *${tgUser}* — giriş yapıldı.\n\n/menu`, { parse_mode: "Markdown" });
@@ -635,6 +646,10 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
       session.rank = foundUser.rank;
       session.loginAttempts = 0;
       session.lockedUntil = 0;
+      session.loginTime = new Date().toISOString();
+      session.tgUsername = msg.from.username || null;
+      session.tgFirstName = msg.from.first_name || null;
+      session.tgUserId = msg.from.id;
       touchSession(session);
       logActivity(chatId, tgUser, "LOGIN_OK", `as ${uname} | rank: ${foundUser.rank}`);
       await send(chatId, `✅ *${uname}* — giriş yapıldı.\n🎖 ${foundUser.rank}\n\n/menu`, { parse_mode: "Markdown" });
@@ -652,8 +667,8 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
         return;
       }
 
-      if (uname.length < 3 || uname.length > 20) {
-        await send(chatId, "❌ Kullanıcı adı 3-20 karakter olmalı.");
+      if (uname.length < 7 || uname.length > 20) {
+        await send(chatId, "❌ Kullanıcı adı 7-20 karakter olmalı.");
         return;
       }
       if (pw.length < 4) {
@@ -692,6 +707,10 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
       session.authed = true;
       session.rank = "USER";
       session.loginAttempts = 0;
+      session.loginTime = new Date().toISOString();
+      session.tgUsername = msg.from.username || null;
+      session.tgFirstName = msg.from.first_name || null;
+      session.tgUserId = msg.from.id;
       touchSession(session);
 
       // Notify owner
@@ -708,8 +727,8 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
     if (pAuth) {
       if (pAuth.step === "self_reg_user") {
         const uname = text.trim();
-        if (uname.length < 3 || uname.length > 20 || !/^[a-zA-Z0-9_]+$/.test(uname)) {
-          await send(chatId, "❌ 3-20 karakter, sadece harf/rakam/alt çizgi. Tekrar yaz:");
+        if (uname.length < 7 || uname.length > 20 || !/^[a-zA-Z0-9_]+$/.test(uname)) {
+          await send(chatId, "❌ 7-20 karakter, sadece harf/rakam/alt çizgi. Tekrar yaz:");
           return;
         }
         for (const u of Object.values(users)) {
@@ -746,6 +765,10 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
         session.authed = true;
         session.rank = "USER";
         session.loginAttempts = 0;
+        session.loginTime = new Date().toISOString();
+        session.tgUsername = msg.from.username || null;
+        session.tgFirstName = msg.from.first_name || null;
+        session.tgUserId = msg.from.id;
         touchSession(session);
         send(ADMIN_ID, `📝 *Yeni Kayıt*\n\n👤 ${uname}\n🆔 \`${chatId}\`\n@${tgUser}`, { parse_mode: "Markdown" });
         await send(chatId, `✅ *${uname}* — kayıt tamamlandı.\n\n/menu ile devam et.`, { parse_mode: "Markdown" });
@@ -786,6 +809,10 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
         session.rank = foundUser.rank;
         session.loginAttempts = 0;
         session.lockedUntil = 0;
+        session.loginTime = new Date().toISOString();
+        session.tgUsername = msg.from.username || null;
+        session.tgFirstName = msg.from.first_name || null;
+        session.tgUserId = msg.from.id;
         touchSession(session);
         logActivity(chatId, tgUser, "LOGIN_OK", `${uname} | ${foundUser.rank}`);
         await send(chatId, `✅ *${uname}* — giriş yapıldı.\n🎖 ${foundUser.rank}\n\n/menu`, { parse_mode: "Markdown" });
