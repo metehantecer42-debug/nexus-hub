@@ -18,9 +18,52 @@ app.use((req, res, next) => {
   res.setHeader("X-Frame-Options", "DENY");
   res.setHeader("X-XSS-Protection", "1; mode=block");
   res.setHeader("Referrer-Policy", "no-referrer");
-  res.setHeader("Cache-Control", "no-store");
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+  res.setHeader("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'");
+  res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  res.setHeader("X-Permitted-Cross-Domain-Policies", "none");
   next();
 });
+
+// Input sanitization — strip control chars, null bytes, telegram injection
+function sanitizeInput(str) {
+  if (typeof str !== "string") return "";
+  return str
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "") // control chars
+    .replace(/\0/g, "") // null bytes
+    .trim()
+    .slice(0, 500); // max length
+}
+
+// Validate username — alphanumeric + underscore only, 7-20 chars
+function isValidUsername(u) {
+  return typeof u === "string" && /^[a-zA-Z0-9_]{7,20}$/.test(u);
+}
+
+// Validate password — 4-30 chars, no control chars
+function isValidPassword(p) {
+  return typeof p === "string" && p.length >= 4 && p.length <= 30 && !/[\x00-\x1F\x7F]/.test(p);
+}
+
+// Block path traversal and injection in any user input
+function hasMaliciousContent(str) {
+  if (!str) return false;
+  const patterns = [
+    /\.\.\//,            // path traversal
+    /<script/i,          // XSS
+    /javascript:/i,      // JS protocol
+    /on\w+\s*=/i,        // event handlers
+    /\$\{.*\}/,          // template injection
+    /eval\s*\(/i,        // eval
+    /require\s*\(/i,     // require injection
+    /process\./i,        // process access
+    /__proto__/i,        // prototype pollution
+    /constructor\s*\[/i, // constructor access
+  ];
+  return patterns.some(p => p.test(str));
+}
 
 // ─── RATE LIMITER ───────────────────────────────────────────
 const rateLimits = {};   // ip -> { count, resetAt }
@@ -176,9 +219,39 @@ function isSessionExpired(s) {
 
 function touchSession(s) { s.lastActivity = Date.now(); }
 
+const actionNames = {
+  START: "🟢 Botu başlattı",
+  MENU: "📋 Ana menüyü açtı",
+  LOGIN_OWNER: "👑 Owner olarak giriş yaptı",
+  LOGIN_OK: "✅ Giriş yaptı",
+  LOGOUT: "🚪 Çıkış yaptı",
+  SELF_REGISTER: "📝 Kayıt oldu",
+  KEY_CREATE_START: "🔑 Key oluşturmaya başladı",
+  KEY_CREATED: "🔑 Key oluşturdu",
+  KEY_LIST: "📋 Keyleri listeledi",
+  KEY_DELETED: "🗑 Key sildi",
+  VIEW_USERS: "👥 Kullanıcıları görüntüledi",
+  WATCH_VIDEO: "📹 Tanıtım videosunu izledi",
+  DELTA_BYPASS_START: "🔓 Delta bypass başlattı",
+  DELTA_BYPASS: "🔓 Delta bypass kullandı",
+  MAINTENANCE: "🔧 Bakım modunu değiştirdi",
+  BACKUP: "💾 Yedek aldı",
+  RESTORE: "📥 Yedek yükledi",
+  USER_ADDED: "➕ Kullanıcı ekledi",
+  USER_DELETED: "➖ Kullanıcı sildi",
+  RANK_CHANGED: "🎖 Yetki değiştirdi",
+  ANNOUNCE_SET: "📢 Duyuru yayınladı",
+  ANNOUNCE_CLEAR: "📢 Duyuruyu kaldırdı",
+  BAN: "🚫 Kullanıcı banladı",
+  UNBAN: "✅ Ban kaldırdı",
+  KEY_OK: "🔑 Key doğrulandı (API)",
+  TEXT_INPUT: "💬 Mesaj yazdı",
+  BUTTON_PRESS: "🔘 Butona bastı",
+};
+
 function logActivity(chatId, username, action, detail = "") {
   activityLog.push({ time: new Date().toISOString(), chatId: String(chatId), username: username || "?", action, detail });
-  if (activityLog.length > 500) activityLog.shift();
+  if (activityLog.length > 1000) activityLog.shift();
 }
 
 function logSecurity(chatId, username, type, detail = "") {
@@ -186,18 +259,47 @@ function logSecurity(chatId, username, type, detail = "") {
   securityAlerts.push(entry);
   if (securityAlerts.length > 200) securityAlerts.shift();
   // Notify owner on critical events
-  const critical = ["BRUTE_FORCE", "BANNED_ACCESS", "FLOOD", "RATE_LIMIT", "INVALID_PAYLOAD", "MALFORMED_KEY"];
+  // Türkçe alarm isimleri
+  const alertNames = {
+    BRUTE_FORCE: "🔴 Şifre Kırma Denemesi",
+    BANNED_ACCESS: "🚫 Banlı Kullanıcı Erişim Denemesi",
+    FLOOD: "🌊 Mesaj Seli (Flood)",
+    RATE_LIMIT: "⚡ Çok Fazla İstek (Rate Limit)",
+    MALFORMED_KEY: "🔑 Sahte Key Denemesi",
+    FAILED_LOGIN: "❌ Başarısız Giriş",
+    LOCKED_ATTEMPT: "🔒 Kilitli Hesaptan Giriş Denemesi",
+    NEW_REGISTER: "📝 Yeni Kayıt",
+    UNAUTH_CMD: "⚠️ Yetkisiz Komut Denemesi",
+    MALICIOUS_INPUT: "💀 Zararlı İçerik Denemesi",
+    INVALID_KEY: "🔑 Geçersiz Key",
+    UNKNOWN_ROUTE: "🌐 Bilinmeyen URL Denemesi",
+  };
+
+  const critical = ["BRUTE_FORCE", "BANNED_ACCESS", "FLOOD", "RATE_LIMIT", "MALFORMED_KEY", "MALICIOUS_INPUT"];
   if (critical.includes(type)) {
-    send(ADMIN_ID, `🚨 *GÜVENLİK ALARMI*\n\nTip: \`${type}\`\nKim: @${username || "?"} (\`${chatId}\`)\nDetay: ${detail}\nZaman: ${entry.time}`, { parse_mode: "Markdown" });
+    const name = alertNames[type] || type;
+    send(ADMIN_ID,
+      `🚨 *GÜVENLİK ALARMI*\n\n` +
+      `${name}\n\n` +
+      `👤 Kim: @${username || "bilinmiyor"}\n` +
+      `🆔 Chat ID: \`${chatId}\`\n` +
+      `📋 Ne oldu: ${detail || "—"}\n` +
+      `🕐 Saat: ${entry.time.slice(11, 19)}`,
+      { parse_mode: "Markdown" });
   }
 
   // Auto-ban after 3 brute force lockouts
   if (type === "BRUTE_FORCE") {
     const bfCount = securityAlerts.filter(a => a.chatId === String(chatId) && a.type === "BRUTE_FORCE").length;
     if (bfCount >= 3 && !bannedUsers[chatId]) {
-      bannedUsers[chatId] = { reason: "Otomatik ban: 3x brute force", bannedAt: new Date().toISOString(), bannedBy: "SYSTEM" };
+      bannedUsers[chatId] = { reason: "3 kez şifre kırma denemesi — otomatik ban", bannedAt: new Date().toISOString(), bannedBy: "SİSTEM" };
       if (sessions[chatId]) { sessions[chatId].authed = false; sessions[chatId].rank = null; }
-      send(ADMIN_ID, `🤖 *OTOMATİK BAN*\n\n\`${chatId}\` @${username}\n3 kez brute force — otomatik banlandı`, { parse_mode: "Markdown" });
+      send(ADMIN_ID,
+        `🤖 *OTOMATİK BAN*\n\n` +
+        `👤 @${username}\n` +
+        `🆔 \`${chatId}\`\n` +
+        `📋 3 kez şifre kırma — otomatik banlandı`,
+        { parse_mode: "Markdown" });
     }
   }
 }
@@ -307,9 +409,9 @@ let pending = {};
 // path, they get 404. The token in the URL is the secret.
 // Additional: verify the update has required Telegram fields.
 function isValidTelegramUpdate(body) {
-  if (!body) return false;
-  if (body.message) return body.message.chat && body.message.chat.id;
-  if (body.callback_query) return body.callback_query.message && body.callback_query.from;
+  if (!body || typeof body !== "object") return false;
+  // any update with update_id is a legit Telegram payload
+  if (body.update_id !== undefined) return true;
   return false;
 }
 
@@ -346,6 +448,32 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
 
     await answerCb(cb.id);
 
+    // Genel buton takibi — her butona basışı logla
+    const btnLabels = {
+      self_register: "Kayıt Ol butonu",
+      self_login: "Giriş Yap butonu",
+      logout: "Çıkış butonu",
+      create_key: "Key Oluştur butonu",
+      view_keys: "Keyleri Gör butonu",
+      view_users: "Kullanıcıları Gör butonu",
+      show_video: "Video İzle butonu",
+      delta_bypass_prompt: "Delta Bypass butonu",
+      toggle_maintenance: "Bakım Modu butonu",
+      view_activity: "Aktivite Logu butonu",
+      view_security: "Güvenlik Logları butonu",
+      view_sessions: "Aktif Oturumlar butonu",
+      add_user: "Kullanıcı Ekle butonu",
+      del_user: "Kullanıcı Sil butonu",
+      change_rank: "Yetki Değiştir butonu",
+      del_key: "Key Sil butonu",
+      set_announce: "Duyuru butonu",
+      ban_user: "Ban butonu",
+      unban_user: "Unban butonu",
+    };
+    if (btnLabels[data]) {
+      logActivity(chatId, tgUser, "BUTTON_PRESS", btnLabels[data]);
+    }
+
     // ── SELF REGISTER (button) ──
     if (data === "self_register") {
       if (users[chatId]) {
@@ -361,7 +489,7 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
     if (data === "self_login") {
       if (isLocked(session)) {
         const rem = Math.ceil((session.lockedUntil - Date.now()) / 60000);
-        await send(chatId, `🔒 Kilitli. ${rem}dk bekle.`);
+        await send(chatId, `🔒 Hesabın kilitli. ${rem} dakika sonra tekrar dene.`);
         return;
       }
       pending[chatId] = { step: "login_user" };
@@ -552,18 +680,40 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
 
     // ACTIVITY LOG
     if (data === "view_activity") {
-      const last20 = activityLog.slice(-20).reverse();
-      let txt = last20.length ? "📊 *Son Aktiviteler:*\n\n" : "📊 Henüz aktivite yok.";
-      for (const e of last20) txt += `\`${e.time.slice(11,19)}\` @${e.username} — *${e.action}*${e.detail ? `\n   ${e.detail}` : ""}\n`;
+      const last25 = activityLog.slice(-25).reverse();
+      let txt = last25.length ? "📊 *Son Aktiviteler:*\n\n" : "📊 Henüz aktivite yok.";
+      for (const e of last25) {
+        const label = actionNames[e.action] || e.action;
+        const t = e.time.slice(11, 19);
+        txt += `\`${t}\` @${e.username}\n   ${label}${e.detail ? ` — ${e.detail}` : ""}\n\n`;
+      }
       await editMsg(chatId, msgId, txt, { parse_mode: "Markdown", reply_markup: JSON.stringify(mainMenu(session.rank)) });
       return;
     }
 
     // SECURITY LOG
     if (data === "view_security") {
-      const last20 = securityAlerts.slice(-20).reverse();
-      let txt = last20.length ? "🚨 *Güvenlik:*\n\n" : "🚨 Kayıt yok.";
-      for (const e of last20) txt += `\`${e.time.slice(11,19)}\` [${e.type}] @${e.username}\n   ${e.detail}\n\n`;
+      const last25 = securityAlerts.slice(-25).reverse();
+      let txt = last25.length ? "🚨 *Güvenlik Logları:*\n\n" : "🚨 Kayıt yok.";
+      const secNames = {
+        BRUTE_FORCE: "🔴 Şifre Kırma",
+        BANNED_ACCESS: "🚫 Banlı Erişim",
+        FLOOD: "🌊 Mesaj Seli",
+        RATE_LIMIT: "⚡ Çok Fazla İstek",
+        MALFORMED_KEY: "🔑 Sahte Key",
+        FAILED_LOGIN: "❌ Yanlış Şifre",
+        LOCKED_ATTEMPT: "🔒 Kilitli Hesap",
+        INVALID_PAYLOAD: "⚠️ Geçersiz İstek",
+        MALICIOUS_INPUT: "💀 Zararlı İçerik",
+        INVALID_KEY: "🔑 Geçersiz Key",
+        UNKNOWN_ROUTE: "🌐 Bilinmeyen URL",
+        NEW_REGISTER: "📝 Yeni Kayıt",
+        UNAUTH_CMD: "⚠️ Yetkisiz Komut",
+      };
+      for (const e of last25) {
+        const label = secNames[e.type] || e.type;
+        txt += `\`${e.time.slice(11,19)}\` ${label}\n   👤 @${e.username} — ${e.detail || "—"}\n\n`;
+      }
       await editMsg(chatId, msgId, txt, { parse_mode: "Markdown", reply_markup: JSON.stringify(mainMenu(session.rank)) });
       return;
     }
@@ -590,15 +740,30 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
   if (body.message && body.message.text) {
     const msg = body.message;
     const chatId = msg.chat.id;
-    const text = msg.text.trim();
+    const rawText = msg.text.trim();
+    const text = sanitizeInput(rawText);
     const tgUser = msg.from.username || msg.from.first_name || "?";
     const session = getSession(chatId);
     session.lastIp = ip;
+    session.tgUsername = msg.from.username || null;
+    session.tgFirstName = msg.from.first_name || null;
+    session.tgUserId = msg.from.id;
+
+    // Malicious input check
+    if (hasMaliciousContent(text)) {
+      logSecurity(chatId, tgUser, "MALICIOUS_INPUT", text.slice(0, 60));
+      return;
+    }
 
     // Anti-flood check
     if (!floodCheck(chatId)) {
       logSecurity(chatId, tgUser, "FLOOD", "mesaj flood — susturuldu");
       return; // silently drop flood messages
+    }
+
+    // Genel mesaj takibi — her yazılanı logla (şifre hariç)
+    if (!session.pending || (session.pending !== "self_reg_pass" && session.pending !== "login_pass")) {
+      logActivity(chatId, tgUser, "TEXT_INPUT", text.length > 50 ? text.slice(0, 50) + "…" : text);
     }
 
     // Auto-seed owner
@@ -666,7 +831,7 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
       if (isLocked(session)) {
         const rem = Math.ceil((session.lockedUntil - Date.now()) / 60000);
         logSecurity(chatId, tgUser, "LOCKED_ATTEMPT", `${rem}dk`);
-        await send(chatId, `🔒 Kilitli. ${rem}dk bekleyin.`);
+        await send(chatId, `🔒 Hesabın kilitli. ${rem} dakika sonra tekrar dene.`);
         return;
       }
 
@@ -707,10 +872,10 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
         if (session.loginAttempts >= MAX_LOGIN_ATTEMPTS) {
           session.lockedUntil = Date.now() + LOCKOUT_MINUTES * 60000;
           logSecurity(chatId, tgUser, "BRUTE_FORCE", `${MAX_LOGIN_ATTEMPTS} deneme — kilitlendi`);
-          await send(chatId, `🚨 ${LOCKOUT_MINUTES}dk kilitlendi.`);
+          await send(chatId, `🚨 Çok fazla yanlış deneme! Hesabın ${LOCKOUT_MINUTES} dakika kilitlendi.`);
           return;
         }
-        await send(chatId, `❌ Hatalı bilgi. Kalan hak: ${rem}`);
+        await send(chatId, `❌ Kullanıcı adı veya şifre yanlış. ${rem} deneme hakkın kaldı.`);
         return;
       }
 
@@ -857,7 +1022,7 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
         delete pending[chatId];
         if (isLocked(session)) {
           const rem = Math.ceil((session.lockedUntil - Date.now()) / 60000);
-          await send(chatId, `🔒 ${rem}dk kilitli.`);
+          await send(chatId, `🔒 Hesabın kilitli. ${rem} dakika sonra tekrar dene.`);
           return;
         }
         let foundUser = null;
@@ -871,10 +1036,10 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
           if (session.loginAttempts >= MAX_LOGIN_ATTEMPTS) {
             session.lockedUntil = Date.now() + LOCKOUT_MINUTES * 60000;
             logSecurity(chatId, tgUser, "BRUTE_FORCE", `${MAX_LOGIN_ATTEMPTS} deneme — kilitlendi`);
-            await send(chatId, `🚨 ${LOCKOUT_MINUTES}dk kilitlendi.`);
+            await send(chatId, `🚨 Çok fazla yanlış deneme! Hesabın ${LOCKOUT_MINUTES} dakika kilitlendi.`);
             return;
           }
-          await send(chatId, `❌ Hatalı bilgi. Kalan: ${rem}`);
+          await send(chatId, `❌ Kullanıcı adı veya şifre yanlış. ${rem} deneme hakkın kaldı.`);
           return;
         }
         session.authed = true;
