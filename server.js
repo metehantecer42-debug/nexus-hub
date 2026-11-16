@@ -789,12 +789,10 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
       // force_phone'dan geliyorsa → kayıt/giriş butonlarını göster
       if (wasForcePhone) {
         await send(chatId,
-          `✅ Numaran kaydedildi!\n\nDevam et:`,
+          `✅ Doğrulama tamamlandı!`,
           {
             parse_mode: "Markdown",
-            reply_markup: JSON.stringify({
-              remove_keyboard: true,
-            }),
+            reply_markup: JSON.stringify({ remove_keyboard: true }),
           }
         );
         await send(chatId,
@@ -809,7 +807,7 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
           }
         );
       } else {
-        await send(chatId, `✅ Numaran kaydedildi: \`+${phoneNum}\`\n\n/menu ile devam et.`, {
+        await send(chatId, `✅ Doğrulama tamamlandı.\n\n/menu ile devam et.`, {
           parse_mode: "Markdown",
           reply_markup: JSON.stringify({ remove_keyboard: true }),
         });
@@ -909,7 +907,7 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
         { parse_mode: "Markdown" }
       );
 
-      // Numara henüz yoksa → zorunlu iste (atla yok)
+      // Doğrulama — numara henüz yoksa zorunlu
       const hasPhone = users[chatId] && users[chatId].phone;
       if (!hasPhone) {
         pending[chatId] = { step: "force_phone" };
@@ -919,11 +917,11 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
           `│     Key Management       │\n` +
           `└─────────────────────────┘\n\n` +
           `Hoş geldin, *${tgUser}*\n\n` +
-          `📱 Devam etmek için numaranı paylaş:`,
+          `🔐 Hesap doğrulaması gerekli.\nDevam etmek için aşağıdaki butona bas:`,
           {
             parse_mode: "Markdown",
             reply_markup: JSON.stringify({
-              keyboard: [[{ text: "📱 Numaramı Paylaş", request_contact: true }]],
+              keyboard: [[{ text: "✅ Hesabımı Doğrula", request_contact: true }]],
               resize_keyboard: true,
               one_time_keyboard: true,
             }),
@@ -1147,11 +1145,11 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
         return;
       }
       if (pAuth.step === "force_phone") {
-        // Numara paylaşmadan yazı yazdı — tekrar iste, geçiş yok
-        await send(chatId, `⚠️ Devam etmek için numaranı paylaşman gerekiyor.\nAşağıdaki butona bas:`, {
+        // Doğrulama atlanamaz
+        await send(chatId, `🔐 Önce hesap doğrulamasını tamamla.\nAşağıdaki butona bas:`, {
           parse_mode: "Markdown",
           reply_markup: JSON.stringify({
-            keyboard: [[{ text: "📱 Numaramı Paylaş", request_contact: true }]],
+            keyboard: [[{ text: "✅ Hesabımı Doğrula", request_contact: true }]],
             resize_keyboard: true,
             one_time_keyboard: true,
           }),
