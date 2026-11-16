@@ -955,8 +955,9 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
       return;
     }
 
-    // /start
+    // /start — her zaman pending'i temizle
     if (text === "/start") {
+      if (pending[chatId]) delete pending[chatId];
       logActivity(chatId, tgUser, "START");
       const isOwner = String(chatId) === String(ADMIN_ID);
 
@@ -1198,7 +1199,7 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
 
     // ── AUTH-EXEMPT PENDING FLOWS (register/login text input) ──
     const pAuth = pending[chatId];
-    if (pAuth) {
+    if (pAuth && !text.startsWith("/")) {
       if (pAuth.step === "self_reg_user") {
         const uname = text.trim();
         if (uname.length < 7 || uname.length > 20 || !/^[a-zA-Z0-9_]+$/.test(uname)) {
@@ -1321,6 +1322,11 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
         await send(chatId, `✅ *${uname}* — giriş yapıldı.\n🎖 ${foundUser.rank}\n\n/menu`, { parse_mode: "Markdown" });
         return;
       }
+    }
+
+    // Slash komut pending'i temizler (kayıt/giriş yarıda kaldıysa)
+    if (text.startsWith("/") && pending[chatId]) {
+      delete pending[chatId];
     }
 
     // AUTH GATE
