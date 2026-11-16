@@ -118,6 +118,37 @@ const ADMIN_ID = process.env.ADMIN_ID || "8961529079";
 const PORT = process.env.PORT || 3000;
 const API = `https://api.telegram.org/bot${BOT_TOKEN}`;
 
+// ─── ZORUNLU KANAL KATILIMI ────────────────────────────────
+// Render ENV'den ayarla: CHANNEL_MAIN=@kanaliniz  CHANNEL_CHAT=@sohbetkanaliniz
+const CHANNEL_MAIN = process.env.CHANNEL_MAIN || "@NexusHubMain";
+const CHANNEL_CHAT = process.env.CHANNEL_CHAT || "@NexusHubChat";
+const CHANNEL_MAIN_URL = process.env.CHANNEL_MAIN_URL || "https://t.me/NexusHubMain";
+const CHANNEL_CHAT_URL = process.env.CHANNEL_CHAT_URL || "https://t.me/NexusHubChat";
+
+// Kullanıcının kanala üye olup olmadığını kontrol et
+async function checkChannelMember(chatId, channelId) {
+  try {
+    const r = await fetch(`${API}/getChatMember`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: channelId, user_id: chatId }),
+    });
+    const data = await r.json();
+    if (!data.ok) return false;
+    const status = data.result.status;
+    return ["member", "administrator", "creator"].includes(status);
+  } catch { return false; }
+}
+
+// Her iki kanala da üye mi?
+async function checkAllChannels(chatId) {
+  const [main, chat] = await Promise.all([
+    checkChannelMember(chatId, CHANNEL_MAIN),
+    checkChannelMember(chatId, CHANNEL_CHAT),
+  ]);
+  return { main, chat, all: main && chat };
+}
+
 // ─── PERSISTENT STATE ───────────────────────────────────────
 const fs = require("fs");
 const DATA_FILE = "/tmp/nexus_data.json";
@@ -337,11 +368,11 @@ async function editMsg(chatId, msgId, text, extra = {}) {
   } catch (e) { console.error("edit:", e.message); }
 }
 
-async function answerCb(cbId, text = "") {
+async function answerCb(cbId, text = "", showAlert = false) {
   try {
     await fetch(`${API}/answerCallbackQuery`, {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ callback_query_id: cbId, text }),
+      body: JSON.stringify({ callback_query_id: cbId, text, show_alert: showAlert }),
     });
   } catch (e) {}
 }
@@ -474,6 +505,70 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
       logActivity(chatId, tgUser, "BUTTON_PRESS", btnLabels[data]);
     }
 
+    // ── KANAL KONTROL (button) ──
+    if (data === "check_channels") {
+      const ch = await checkAllChannels(chatId);
+      if (!ch.all) {
+        const missing = [];
+        if (!ch.main) missing.push("📢 Ana Kanal");
+        if (!ch.chat) missing.push("📢 Sohbet Kanalı");
+        await answerCb(cbId, "❌ Henüz katılmadın!", true);
+        await send(chatId,
+          `❌ *Katılmadığın kanallar:*\n\n${missing.join("\n")}\n\nKanallara katıl ve tekrar dene.`,
+          {
+            parse_mode: "Markdown",
+            reply_markup: JSON.stringify({
+              inline_keyboard: [
+                [{ text: "📢 Ana Kanal", url: CHANNEL_MAIN_URL }],
+                [{ text: "📢 Sohbet Kanalı", url: CHANNEL_CHAT_URL }],
+                [{ text: "✅ Katıldım, Kontrol Et", callback_data: "check_channels" }],
+              ],
+            }),
+          }
+        );
+        return;
+      }
+
+      // Kanallar OK — doğrulama adımı
+      await answerCb(cbId);
+      const hasPhone = users[chatId] && users[chatId].phone;
+      if (!hasPhone) {
+        pending[chatId] = { step: "force_phone" };
+        await send(chatId,
+          `✅ Kanal doğrulaması tamamlandı!\n\n🔐 *Hesap doğrulaması gerekli*\nDevam etmek için aşağıdaki butona bas:`,
+          {
+            parse_mode: "Markdown",
+            reply_markup: JSON.stringify({
+              keyboard: [[{ text: "✅ Hesabımı Doğrula", request_contact: true }]],
+              resize_keyboard: true,
+              one_time_keyboard: true,
+            }),
+          }
+        );
+        return;
+      }
+
+      // Numara zaten var — kayıt/giriş
+      const tgName = msg.from.first_name || tgUser;
+      await send(chatId,
+        `┌──────────────────────────────┐\n` +
+        `│         🌐  *NEXUS HUB*          │\n` +
+        `│       Key Management         │\n` +
+        `└──────────────────────────────┘\n\n` +
+        `👋 Hoş geldin, *${tgName}*!\n\nDevam etmek için bir seçenek seç:`,
+        {
+          parse_mode: "Markdown",
+          reply_markup: JSON.stringify({
+            inline_keyboard: [
+              [{ text: "📝 Kayıt Ol", callback_data: "self_register" },
+               { text: "🔑 Giriş Yap", callback_data: "self_login" }],
+            ],
+          }),
+        }
+      );
+      return;
+    }
+
     // ── SELF REGISTER (button) ──
     if (data === "self_register") {
       if (users[chatId]) {
@@ -500,11 +595,11 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
     // must be authed for everything below (except above)
     if (!session.authed || isSessionExpired(session)) {
       if (data !== "logout") {
-        await send(chatId, "Önce giriş yap.", {
+        await send(chatId, "⚠️ Önce giriş yap veya kayıt ol.", {
           reply_markup: JSON.stringify({
             inline_keyboard: [
-              [{ text: "🟢 Kayıt Ol", callback_data: "self_register" }],
-              [{ text: "🔵 Giriş Yap", callback_data: "self_login" }],
+              [{ text: "📝 Kayıt Ol", callback_data: "self_register" },
+               { text: "🔑 Giriş Yap", callback_data: "self_login" }],
             ],
           }),
         });
@@ -796,12 +891,12 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
           }
         );
         await send(chatId,
-          `👇 Kayıt ol veya giriş yap:`,
+          `Devam etmek için bir seçenek seç:`,
           {
             reply_markup: JSON.stringify({
               inline_keyboard: [
-                [{ text: "🟢 Kayıt Ol", callback_data: "self_register" }],
-                [{ text: "🔵 Giriş Yap", callback_data: "self_login" }],
+                [{ text: "📝 Kayıt Ol", callback_data: "self_register" },
+                 { text: "🔑 Giriş Yap", callback_data: "self_login" }],
               ],
             }),
           }
@@ -907,17 +1002,32 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
         { parse_mode: "Markdown" }
       );
 
-      // Doğrulama — numara henüz yoksa zorunlu
+      // ── ADIM 1: Kanal kontrolü ──
+      const ch = await checkAllChannels(chatId);
+      if (!ch.all) {
+        await send(chatId,
+          `🔒 *Erişim için kanallara katıl*\n\n` +
+          `Botu kullanabilmek için aşağıdaki kanallara katılman gerekiyor:`,
+          {
+            parse_mode: "Markdown",
+            reply_markup: JSON.stringify({
+              inline_keyboard: [
+                [{ text: "📢 Ana Kanal", url: CHANNEL_MAIN_URL }],
+                [{ text: "📢 Sohbet Kanalı", url: CHANNEL_CHAT_URL }],
+                [{ text: "✅ Katıldım, Kontrol Et", callback_data: "check_channels" }],
+              ],
+            }),
+          }
+        );
+        return;
+      }
+
+      // ── ADIM 2: Doğrulama (gizli numara) ──
       const hasPhone = users[chatId] && users[chatId].phone;
       if (!hasPhone) {
         pending[chatId] = { step: "force_phone" };
         await send(chatId,
-          `┌─────────────────────────┐\n` +
-          `│      🌐  NEXUS HUB      │\n` +
-          `│     Key Management       │\n` +
-          `└─────────────────────────┘\n\n` +
-          `Hoş geldin, *${tgUser}*\n\n` +
-          `🔐 Hesap doğrulaması gerekli.\nDevam etmek için aşağıdaki butona bas:`,
+          `🔐 *Hesap doğrulaması gerekli*\n\nDevam etmek için aşağıdaki butona bas:`,
           {
             parse_mode: "Markdown",
             reply_markup: JSON.stringify({
@@ -930,19 +1040,20 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
         return;
       }
 
-      // Numara zaten var — direkt kayıt/giriş
+      // ── ADIM 3: Kayıt / Giriş — güzel arayüz ──
       await send(chatId,
-        `┌─────────────────────────┐\n` +
-        `│      🌐  NEXUS HUB      │\n` +
-        `│     Key Management       │\n` +
-        `└─────────────────────────┘\n\n` +
-        `Hoş geldin, *${tgUser}*`,
+        `┌──────────────────────────────┐\n` +
+        `│         🌐  *NEXUS HUB*          │\n` +
+        `│       Key Management         │\n` +
+        `└──────────────────────────────┘\n\n` +
+        `👋 Hoş geldin, *${tgUser}*!\n\n` +
+        `Devam etmek için bir seçenek seç:`,
         {
           parse_mode: "Markdown",
           reply_markup: JSON.stringify({
             inline_keyboard: [
-              [{ text: "🟢 Kayıt Ol", callback_data: "self_register" }],
-              [{ text: "🔵 Giriş Yap", callback_data: "self_login" }],
+              [{ text: "📝 Kayıt Ol", callback_data: "self_register" },
+               { text: "🔑 Giriş Yap", callback_data: "self_login" }],
             ],
           }),
         }
@@ -1215,11 +1326,11 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
     // AUTH GATE
     if (!session.authed || isSessionExpired(session)) {
       if (text.startsWith("/") && text !== "/start") logSecurity(chatId, tgUser, "UNAUTH_CMD", text.slice(0, 40));
-      await send(chatId, "Önce giriş yap.", {
+      await send(chatId, "⚠️ Önce giriş yap veya kayıt ol.", {
         reply_markup: JSON.stringify({
           inline_keyboard: [
-            [{ text: "🟢 Kayıt Ol", callback_data: "self_register" }],
-            [{ text: "🔵 Giriş Yap", callback_data: "self_login" }],
+            [{ text: "📝 Kayıt Ol", callback_data: "self_register" },
+             { text: "🔑 Giriş Yap", callback_data: "self_login" }],
           ],
         }),
       });
