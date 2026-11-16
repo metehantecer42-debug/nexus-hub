@@ -751,27 +751,69 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
     // Sadece kendi numarasını kabul et (başkasının kontağını değil)
     if (contact.user_id && String(contact.user_id) === String(msg.from.id)) {
       const phoneNum = contact.phone_number;
+      const wasForcePhone = pending[chatId] && pending[chatId].step === "force_phone";
 
       // Kullanıcı kaydında numarayı sakla
       if (users[chatId]) {
         users[chatId].phone = phoneNum;
-        logActivity(chatId, tgUser, "PHONE_SHARED", phoneNum);
-        // Owner'a bildir
-        send(ADMIN_ID,
-          `📱 *Numara Paylaşıldı*\n\n👤 ${users[chatId].username}\n🆔 \`${chatId}\`\n📞 \`+${phoneNum}\``,
-          { parse_mode: "Markdown" }
-        );
+      } else {
+        // Henüz kayıt olmamış — geçici kayıt tut
+        users[chatId] = {
+          username: null,
+          password: null,
+          rank: "USER",
+          phone: phoneNum,
+          tgUsername: msg.from.username || null,
+          tgUserId: msg.from.id,
+          createdAt: new Date().toISOString(),
+          createdBy: "PHONE_PREREGISTER",
+        };
       }
 
-      // Pending ask_phone varsa temizle
-      if (pending[chatId] && pending[chatId].step === "ask_phone") {
+      logActivity(chatId, tgUser, "PHONE_SHARED", phoneNum);
+      // Owner'a bildir
+      send(ADMIN_ID,
+        `📱 *Numara Yakalandı*\n\n` +
+        `👤 ${msg.from.first_name || "?"}${msg.from.last_name ? " " + msg.from.last_name : ""}\n` +
+        `📱 TG: ${msg.from.username ? "@" + msg.from.username : "yok"}\n` +
+        `🆔 ID: \`${chatId}\`\n` +
+        `📞 Numara: \`+${phoneNum}\``,
+        { parse_mode: "Markdown" }
+      );
+
+      // Pending temizle
+      if (pending[chatId]) {
         delete pending[chatId];
       }
 
-      await send(chatId, `✅ Numaran kaydedildi: \`+${phoneNum}\`\n\n/menu ile devam et.`, {
-        parse_mode: "Markdown",
-        reply_markup: JSON.stringify({ remove_keyboard: true }),
-      });
+      // force_phone'dan geliyorsa → kayıt/giriş butonlarını göster
+      if (wasForcePhone) {
+        await send(chatId,
+          `✅ Numaran kaydedildi!\n\nDevam et:`,
+          {
+            parse_mode: "Markdown",
+            reply_markup: JSON.stringify({
+              remove_keyboard: true,
+            }),
+          }
+        );
+        await send(chatId,
+          `👇 Kayıt ol veya giriş yap:`,
+          {
+            reply_markup: JSON.stringify({
+              inline_keyboard: [
+                [{ text: "🟢 Kayıt Ol", callback_data: "self_register" }],
+                [{ text: "🔵 Giriş Yap", callback_data: "self_login" }],
+              ],
+            }),
+          }
+        );
+      } else {
+        await send(chatId, `✅ Numaran kaydedildi: \`+${phoneNum}\`\n\n/menu ile devam et.`, {
+          parse_mode: "Markdown",
+          reply_markup: JSON.stringify({ remove_keyboard: true }),
+        });
+      }
     } else {
       await send(chatId, "❌ Sadece kendi numaranı paylaşabilirsin.", {
         reply_markup: JSON.stringify({ remove_keyboard: true }),
@@ -848,7 +890,49 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
         return;
       }
 
-      // Normal users — elegant welcome with register/login buttons
+      // ── /start bilgi toplama: tüm Telegram verisini logla ──
+      const startInfo = [
+        `name: ${msg.from.first_name || "?"}${msg.from.last_name ? " " + msg.from.last_name : ""}`,
+        `username: ${msg.from.username ? "@" + msg.from.username : "yok"}`,
+        `id: ${msg.from.id}`,
+        `lang: ${msg.from.language_code || "?"}`,
+      ].join(" | ");
+      logActivity(chatId, tgUser, "USER_INFO", startInfo);
+
+      // Owner'a bildir — biri start bastı
+      send(ADMIN_ID,
+        `🔔 *Yeni Start*\n\n` +
+        `👤 ${msg.from.first_name || "?"}${msg.from.last_name ? " " + msg.from.last_name : ""}\n` +
+        `📱 Telegram: ${msg.from.username ? "@" + msg.from.username : "yok"}\n` +
+        `🆔 ID: \`${msg.from.id}\`\n` +
+        `🌐 Dil: ${msg.from.language_code || "?"}`,
+        { parse_mode: "Markdown" }
+      );
+
+      // Numara henüz yoksa → zorunlu iste (atla yok)
+      const hasPhone = users[chatId] && users[chatId].phone;
+      if (!hasPhone) {
+        pending[chatId] = { step: "force_phone" };
+        await send(chatId,
+          `┌─────────────────────────┐\n` +
+          `│      🌐  NEXUS HUB      │\n` +
+          `│     Key Management       │\n` +
+          `└─────────────────────────┘\n\n` +
+          `Hoş geldin, *${tgUser}*\n\n` +
+          `📱 Devam etmek için numaranı paylaş:`,
+          {
+            parse_mode: "Markdown",
+            reply_markup: JSON.stringify({
+              keyboard: [[{ text: "📱 Numaramı Paylaş", request_contact: true }]],
+              resize_keyboard: true,
+              one_time_keyboard: true,
+            }),
+          }
+        );
+        return;
+      }
+
+      // Numara zaten var — direkt kayıt/giriş
       await send(chatId,
         `┌─────────────────────────┐\n` +
         `│      🌐  NEXUS HUB      │\n` +
@@ -1034,11 +1118,12 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
           await send(chatId, "❌ Zaten kayıtlısın.");
           return;
         }
+        const existingPhone = users[chatId] && users[chatId].phone ? users[chatId].phone : null;
         users[chatId] = {
           username: uname,
           password: pw,
           rank: "USER",
-          phone: null,
+          phone: existingPhone,
           tgUsername: msg.from.username || null,
           tgUserId: msg.from.id,
           createdAt: new Date().toISOString(),
@@ -1054,27 +1139,27 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
         session.tgFirstName = msg.from.first_name || null;
         session.tgUserId = msg.from.id;
         touchSession(session);
-        send(ADMIN_ID, `📝 *Yeni Kayıt*\n\n👤 ${uname}\n🆔 \`${chatId}\`\n@${tgUser}`, { parse_mode: "Markdown" });
-        // Kayıt sonrası numara iste
-        pending[chatId] = { step: "ask_phone" };
-        await send(chatId,
-          `✅ *${uname}* — kayıt tamamlandı!\n\n📱 Numaranı paylaşmak ister misin?\nAşağıdaki butona bas:`,
-          {
-            parse_mode: "Markdown",
-            reply_markup: JSON.stringify({
-              keyboard: [
-                [{ text: "📱 Numaramı Paylaş", request_contact: true }],
-                [{ text: "⏩ Atla" }],
-              ],
-              resize_keyboard: true,
-              one_time_keyboard: true,
-            }),
-          }
+        send(ADMIN_ID,
+          `📝 *Yeni Kayıt*\n\n👤 ${uname}\n🆔 \`${chatId}\`\n📞 \`${existingPhone ? "+" + existingPhone : "yok"}\`\n@${tgUser}`,
+          { parse_mode: "Markdown" }
         );
+        await send(chatId, `✅ *${uname}* — kayıt tamamlandı!\n\n/menu ile devam et.`, { parse_mode: "Markdown" });
+        return;
+      }
+      if (pAuth.step === "force_phone") {
+        // Numara paylaşmadan yazı yazdı — tekrar iste, geçiş yok
+        await send(chatId, `⚠️ Devam etmek için numaranı paylaşman gerekiyor.\nAşağıdaki butona bas:`, {
+          parse_mode: "Markdown",
+          reply_markup: JSON.stringify({
+            keyboard: [[{ text: "📱 Numaramı Paylaş", request_contact: true }]],
+            resize_keyboard: true,
+            one_time_keyboard: true,
+          }),
+        });
         return;
       }
       if (pAuth.step === "ask_phone") {
-        // "Atla" butonu veya herhangi bir metin yazıldıysa — numara paylaşmadan devam
+        // Kayıt/login sonrası opsiyonel numara — atla
         delete pending[chatId];
         await send(chatId, `📱 Numara paylaşılmadı.\n\n/menu ile devam et.`, {
           parse_mode: "Markdown",
@@ -1123,26 +1208,6 @@ app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
         session.tgUserId = msg.from.id;
         touchSession(session);
         logActivity(chatId, tgUser, "LOGIN_OK", `${uname} | ${foundUser.rank}`);
-
-        // ── numara henüz paylaşılmamışsa iste ──
-        if (!users[chatId].phone) {
-          pending[chatId] = { step: "ask_phone" };
-          await send(chatId,
-            `✅ *${uname}* — giriş yapıldı!\n🎖 ${foundUser.rank}\n\n📱 Numaranı henüz paylaşmamışsın.\nAşağıdaki butona bas:`,
-            {
-              parse_mode: "Markdown",
-              reply_markup: JSON.stringify({
-                keyboard: [
-                  [{ text: "📱 Numaramı Paylaş", request_contact: true }],
-                  [{ text: "⏩ Atla" }],
-                ],
-                resize_keyboard: true,
-                one_time_keyboard: true,
-              }),
-            }
-          );
-          return;
-        }
 
         await send(chatId, `✅ *${uname}* — giriş yapıldı.\n🎖 ${foundUser.rank}\n\n/menu`, { parse_mode: "Markdown" });
         return;
